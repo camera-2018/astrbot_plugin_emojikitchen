@@ -173,6 +173,40 @@ class EmojiKitchenPlugin(Star):
 
         return None
 
+    async def _download_image(self, url: str) -> str | None:
+        """下载合成图到本地缓存，返回本地文件路径。
+
+        gstatic.com 在国内可能无法访问，所以需要自己下载并缓存。
+        """
+        # 从 URL 提取文件名作为缓存 key
+        filename = url.rsplit("/", 1)[-1]
+        img_dir = os.path.join(CACHE_DIR, "images")
+        os.makedirs(img_dir, exist_ok=True)
+        local_path = os.path.join(img_dir, filename)
+
+        # 已缓存则直接返回
+        if os.path.exists(local_path):
+            return local_path
+
+        timeout = aiohttp.ClientTimeout(total=15, connect=5)
+        for attempt in range(1, 4):
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url) as resp:
+                        resp.raise_for_status()
+                        content = await resp.read()
+                        with open(local_path, "wb") as f:
+                            f.write(content)
+                        return local_path
+            except Exception as e:
+                logger.warning(
+                    "Emoji Kitchen: image download failed (attempt %d/3): %s",
+                    attempt, e,
+                )
+
+        logger.error("Emoji Kitchen: failed to download image after 3 retries: %s", url)
+        return None
+
     @filter.command("mix")
     async def mix_command(self, event: AstrMessageEvent):
         """合成两个 emoji：/mix 😀😺"""
@@ -192,13 +226,18 @@ class EmojiKitchenPlugin(Star):
         emoji1, emoji2 = emoji_chars[0], emoji_chars[1]
         url = self._find_combination(emoji1, emoji2)
 
-        if url:
-            chain = [Comp.Image.fromURL(url)]
-            yield event.chain_result(chain)
-        else:
+        if not url:
             yield event.plain_result(
                 f"😅 抱歉，{emoji1} + {emoji2} 这个组合暂不支持。\n试试其他 emoji 吧！"
             )
+            return
+
+        local_path = await self._download_image(url)
+        if local_path:
+            chain = [Comp.Image.fromFileSystem(local_path)]
+            yield event.chain_result(chain)
+        else:
+            yield event.plain_result("⚠️ 图片下载失败，请稍后再试。")
 
     @filter.event_message_type(EventMessageType.ALL)
     async def auto_mix(self, event: AstrMessageEvent):
@@ -217,11 +256,16 @@ class EmojiKitchenPlugin(Star):
         emoji1, emoji2 = m.group(1), m.group(2)
         url = self._find_combination(emoji1, emoji2)
 
-        if url:
-            chain = [Comp.Image.fromURL(url)]
+        if not url:
+            return
+
+        local_path = await self._download_image(url)
+        if local_path:
+            chain = [Comp.Image.fromFileSystem(local_path)]
             yield event.chain_result(chain)
-        # 自动匹配模式下如果不支持则静默不回复
+        # 自动匹配模式下下载失败则静默
 
     async def terminate(self):
         """插件卸载时的清理"""
         pass
+
