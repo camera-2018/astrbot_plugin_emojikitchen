@@ -47,6 +47,20 @@ class EmojiKitchenPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.metadata = None
+        self._proxy = None
+
+    def _get_proxy(self) -> str | None:
+        """从 AstrBot 配置中获取 HTTP 代理"""
+        if self._proxy is not None:
+            return self._proxy or None  # "" means no proxy
+        try:
+            proxy = self.context._config.get("http_proxy", "") or ""
+            self._proxy = proxy.strip()
+            if self._proxy:
+                logger.info("Emoji Kitchen: using proxy %s", self._proxy)
+            return self._proxy or None
+        except Exception:
+            return None
 
     async def initialize(self):
         """异步初始化：下载或加载 metadata.json"""
@@ -93,7 +107,7 @@ class EmojiKitchenPlugin(Star):
                         url.split("/")[2], attempt,
                     )
                     async with aiohttp.ClientSession(timeout=timeout) as session:
-                        async with session.get(url) as resp:
+                        async with session.get(url, proxy=self._get_proxy()) as resp:
                             resp.raise_for_status()
                             # 流式下载，避免大文件占用过多内存
                             with open(tmp_file, "wb") as f:
@@ -192,7 +206,7 @@ class EmojiKitchenPlugin(Star):
         for attempt in range(1, 4):
             try:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url) as resp:
+                    async with session.get(url, proxy=self._get_proxy()) as resp:
                         resp.raise_for_status()
                         content = await resp.read()
                         with open(local_path, "wb") as f:
