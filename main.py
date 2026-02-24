@@ -47,20 +47,18 @@ class EmojiKitchenPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.metadata = None
-        self._proxy = None
 
     def _get_proxy(self) -> str | None:
-        """从 AstrBot 配置中获取 HTTP 代理"""
-        if self._proxy is not None:
-            return self._proxy or None  # "" means no proxy
-        try:
-            proxy = self.context._config.get("http_proxy", "") or ""
-            self._proxy = proxy.strip()
-            if self._proxy:
-                logger.info("Emoji Kitchen: using proxy %s", self._proxy)
-            return self._proxy or None
-        except Exception:
-            return None
+        """从环境变量获取 HTTP 代理。
+
+        AstrBot 会将配置文件中的 http_proxy 写入环境变量，
+        所以直接读取环境变量即可获取代理配置。
+        """
+        for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+            proxy = os.environ.get(var)
+            if proxy:
+                return proxy
+        return None
 
     async def initialize(self):
         """异步初始化：下载或加载 metadata.json"""
