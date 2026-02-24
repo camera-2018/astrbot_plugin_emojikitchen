@@ -1,0 +1,6 @@
+name: astrbot_plugin_emojikitchen
+display_name: Emoji Kitchen
+desc: 发送两个 emoji 自动合成 Google Emoji Kitchen 风格混搭图片。支持 /mix 命令和自动检测。
+version: v1.0.0
+author: camera-2018
+repo: https://github.com/camera-2018/astrbot_plugin_emojikitchen
