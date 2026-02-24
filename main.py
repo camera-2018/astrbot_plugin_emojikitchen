@@ -188,7 +188,11 @@ class EmojiKitchenPlugin(Star):
     async def _download_image(self, url: str) -> str | None:
         """下载合成图到本地缓存，返回本地文件路径。
 
-        gstatic.com 在国内可能无法访问，所以需要自己下载并缓存。
+        gstatic.com 在国内可能无法直接访问，依次尝试：
+        1. 直接下载（走代理如果有）
+        2. WordPress Photon CDN
+        3. wsrv.nl 图片代理
+        4. images.weserv.nl 图片代理
         """
         # 从 URL 提取文件名作为缓存 key
         filename = url.rsplit("/", 1)[-1]
@@ -200,23 +204,39 @@ class EmojiKitchenPlugin(Star):
         if os.path.exists(local_path):
             return local_path
 
+        # 构造镜像 URL 列表
+        # 原始 URL 例：https://www.gstatic.com/android/keyboard/emojikitchen/...
+        stripped = url.replace("https://", "").replace("http://", "")
+        mirror_urls = [
+            url,                                          # 直接下载（走代理）
+            f"https://i0.wp.com/{stripped}",              # WordPress Photon CDN
+            f"https://wsrv.nl/?url={stripped}",            # wsrv.nl 图片代理
+            f"https://images.weserv.nl/?url={stripped}",   # weserv.nl 图片代理
+        ]
+
         timeout = aiohttp.ClientTimeout(total=15, connect=5)
-        for attempt in range(1, 4):
+        for mirror_url in mirror_urls:
             try:
+                # 只有直接访问时才使用代理，镜像源不需要
+                proxy = self._get_proxy() if mirror_url == url else None
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url, proxy=self._get_proxy()) as resp:
+                    async with session.get(mirror_url, proxy=proxy) as resp:
                         resp.raise_for_status()
                         content = await resp.read()
+                        if len(content) < 100:
+                            # 太小的响应可能是错误页面
+                            raise ValueError(f"response too small ({len(content)} bytes)")
                         with open(local_path, "wb") as f:
                             f.write(content)
+                        logger.info("Emoji Kitchen: image downloaded from %s", mirror_url.split("?")[0].split("/")[2])
                         return local_path
             except Exception as e:
                 logger.warning(
-                    "Emoji Kitchen: image download failed (attempt %d/3): %s",
-                    attempt, e,
+                    "Emoji Kitchen: image download failed from %s: %s",
+                    mirror_url.split("?")[0].split("/")[2], e,
                 )
 
-        logger.error("Emoji Kitchen: failed to download image after 3 retries: %s", url)
+        logger.error("Emoji Kitchen: all image sources failed: %s", filename)
         return None
 
     @filter.command("mix")
