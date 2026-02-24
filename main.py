@@ -6,6 +6,7 @@ import regex
 import aiohttp
 
 from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event.filter import EventMessageType
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
@@ -199,7 +200,7 @@ class EmojiKitchenPlugin(Star):
                 f"😅 抱歉，{emoji1} + {emoji2} 这个组合暂不支持。\n试试其他 emoji 吧！"
             )
 
-    @filter.event_message_type()
+    @filter.event_message_type(EventMessageType.ALL)
     async def auto_mix(self, event: AstrMessageEvent):
         """自动检测：当消息恰好是两个 emoji 时合成"""
         if not self.metadata:
