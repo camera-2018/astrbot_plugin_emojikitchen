@@ -4,14 +4,13 @@ import time
 import asyncio
 import hashlib
 from pathlib import Path
-from collections import defaultdict
 
 import regex
 import aiohttp
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.event.filter import EventMessageType
-from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
 
@@ -67,13 +66,12 @@ def _url_to_cache_filename(url: str) -> str:
     return f"{url_hash}{ext or '.png'}"
 
 
-@register("emoji_kitchen", "camera-2018", "Emoji Kitchen - 合成两个 emoji", "1.0.0")
 class EmojiKitchenPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.metadata = None
-        # 按文件名分段锁，避免全局锁阻塞不相关下载
-        self._download_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # 按文件名分段锁，避免全局锁阻塞不相关下载；下载完成后清理
+        self._download_locks: dict[str, asyncio.Lock] = {}
         # 使用框架提供的数据目录
         self._data_dir = StarTools.get_data_dir("emoji_kitchen")
         self._cache_file = self._data_dir / "metadata.json"
@@ -242,9 +240,11 @@ class EmojiKitchenPlugin(Star):
             return str(local_path)
 
         # 按文件名分段锁，仅阻塞同一文件的并发下载
-        async with self._download_locks[filename]:
+        lock = self._download_locks.setdefault(filename, asyncio.Lock())
+        async with lock:
             # double-check：拿到锁后再次检查
             if local_path.exists():
+                self._download_locks.pop(filename, None)
                 return str(local_path)
 
             stripped = url.replace("https://", "").replace("http://", "")
@@ -278,6 +278,7 @@ class EmojiKitchenPlugin(Star):
                                 f.write(content)
                             os.replace(tmp_path, str(local_path))
                             logger.info("Emoji Kitchen: image downloaded from %s", mirror_url.split("?")[0].split("/")[2])
+                            self._download_locks.pop(filename, None)
                             return str(local_path)
                     except Exception as e:
                         logger.warning(
@@ -291,6 +292,7 @@ class EmojiKitchenPlugin(Star):
                                 pass
 
             logger.error("Emoji Kitchen: all image sources failed: %s", filename)
+            self._download_locks.pop(filename, None)
             return None
 
     @filter.command("mix")

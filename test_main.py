@@ -7,17 +7,15 @@ Emoji Kitchen Plugin - Unit Tests
 
 import json
 import os
-import tempfile
-import uuid
+import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 # ============================================================
-# Mock astrbot & aiohttp before importing main
+# Mock astrbot & aiohttp — 使用 patch.dict 保证安全恢复
 # ============================================================
-import sys
 
 
 class _FakeStar:
@@ -29,23 +27,14 @@ class _FakeContext:
     pass
 
 
-# 每次测试运行使用独立目录，避免串扰
-_TEST_DATA_DIR = Path(tempfile.mkdtemp(prefix="emoji_kitchen_test_"))
-
-
-class _FakeStarTools:
-    @staticmethod
-    def get_data_dir(name: str) -> Path:
-        d = _TEST_DATA_DIR / name
-        d.mkdir(parents=True, exist_ok=True)
-        return d
-
+# get_data_dir 返回的路径会在 fixture 中被覆盖
+_fake_data_dir = Path("/tmp/_emoji_kitchen_unused")
 
 _star_module = MagicMock()
 _star_module.Star = _FakeStar
 _star_module.Context = _FakeContext
-_star_module.StarTools = _FakeStarTools
-_star_module.register = lambda *a, **kw: lambda cls: cls
+_star_module.StarTools = MagicMock()
+_star_module.StarTools.get_data_dir = MagicMock(return_value=_fake_data_dir)
 
 _filter_mock = MagicMock()
 _filter_mock.command = lambda *a, **kw: lambda fn: fn
@@ -57,56 +46,47 @@ _event_module.filter = _filter_mock
 _filter_module = MagicMock()
 _filter_module.EventMessageType = MagicMock()
 
-_original_modules: dict[str, object] = {}
-_mocked_keys = [
-    "aiohttp", "astrbot", "astrbot.api", "astrbot.api.event",
-    "astrbot.api.event.filter", "astrbot.api.star",
-    "astrbot.api.message_components",
-]
+_MOCKS = {
+    "aiohttp": MagicMock(),
+    "astrbot": MagicMock(),
+    "astrbot.api": MagicMock(),
+    "astrbot.api.event": _event_module,
+    "astrbot.api.event.filter": _filter_module,
+    "astrbot.api.star": _star_module,
+    "astrbot.api.message_components": MagicMock(),
+}
 
-
-def _install_mocks():
-    mocks = {
-        "aiohttp": MagicMock(),
-        "astrbot": MagicMock(),
-        "astrbot.api": MagicMock(),
-        "astrbot.api.event": _event_module,
-        "astrbot.api.event.filter": _filter_module,
-        "astrbot.api.star": _star_module,
-        "astrbot.api.message_components": MagicMock(),
-    }
-    for key in _mocked_keys:
-        _original_modules[key] = sys.modules.get(key)
-    sys.modules.update(mocks)
-
-
-def _uninstall_mocks():
-    for key in _mocked_keys:
-        orig = _original_modules.get(key)
-        if orig is None:
-            sys.modules.pop(key, None)
-        else:
-            sys.modules[key] = orig
-
-
-_install_mocks()
-
-from main import (
-    emoji_to_codepoint,
-    _url_to_cache_filename,
-    EMOJI_ITER_PATTERN,
-    TWO_EMOJI_MSG_PATTERN,
-    EmojiKitchenPlugin,
-)
+# patch.dict 安全地注入 mock，模块导入后自动恢复 sys.modules
+with patch.dict("sys.modules", _MOCKS):
+    from main import (
+        emoji_to_codepoint,
+        _url_to_cache_filename,
+        EMOJI_ITER_PATTERN,
+        TWO_EMOJI_MSG_PATTERN,
+        EmojiKitchenPlugin,
+    )
 
 
 # ============================================================
 # Fixtures
 # ============================================================
-def _make_plugin(metadata=None):
-    """构造可供测试的 plugin 实例（通过 __init__ 正常初始化）"""
-    plugin = EmojiKitchenPlugin(_FakeContext())
-    plugin.metadata = metadata
+@pytest.fixture
+def plugin(tmp_path):
+    """每个测试独立的 plugin 实例，使用 pytest 管理的临时目录"""
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    p = EmojiKitchenPlugin(_FakeContext())
+    p._data_dir = tmp_path
+    p._cache_file = tmp_path / "metadata.json"
+    p._img_dir = img_dir
+    p.metadata = None
+    return p
+
+
+@pytest.fixture
+def plugin_with_meta(plugin):
+    """带 mock metadata 的 plugin 实例"""
+    plugin.metadata = MOCK_METADATA
     return plugin
 
 
@@ -160,12 +140,10 @@ class TestUrlToCacheFilename:
         assert f1 != f2
 
     def test_preserves_extension(self):
-        f = _url_to_cache_filename("https://example.com/img.webp")
-        assert f.endswith(".webp")
+        assert _url_to_cache_filename("https://example.com/img.webp").endswith(".webp")
 
     def test_default_extension(self):
-        f = _url_to_cache_filename("https://example.com/no-extension")
-        assert f.endswith(".png")
+        assert _url_to_cache_filename("https://example.com/no-extension").endswith(".png")
 
     def test_deterministic(self):
         url = "https://example.com/test.png"
@@ -184,12 +162,10 @@ class TestRegexPatterns:
         assert m.group(2) == "😺"
 
     def test_two_emoji_with_space(self):
-        m = TWO_EMOJI_MSG_PATTERN.match("😀 😺")
-        assert m is not None
+        assert TWO_EMOJI_MSG_PATTERN.match("😀 😺") is not None
 
     def test_two_emoji_with_padding(self):
-        m = TWO_EMOJI_MSG_PATTERN.match("  😀😺  ")
-        assert m is not None
+        assert TWO_EMOJI_MSG_PATTERN.match("  😀😺  ") is not None
 
     def test_reject_text_with_emoji(self):
         assert TWO_EMOJI_MSG_PATTERN.match("hello 😀😺") is None
@@ -216,8 +192,7 @@ class TestRegexPatterns:
         assert m.group(2) == "👩‍🎤"
 
     def test_two_same_emoji(self):
-        m = TWO_EMOJI_MSG_PATTERN.match("🔥🔥")
-        assert m is not None
+        assert TWO_EMOJI_MSG_PATTERN.match("🔥🔥") is not None
 
     def test_skin_tone_emoji_as_two(self):
         """带肤色修饰符的 emoji 必须匹配为两个完整 emoji"""
@@ -227,7 +202,7 @@ class TestRegexPatterns:
         assert emojis[1] == "🤚🏿"
 
     def test_flag_emoji_as_one(self):
-        """旗帜 emoji（两个 regional indicator）应被识别为一个 emoji"""
+        """旗帜 emoji 应被识别为一个 emoji"""
         emojis = [m.group(0) for m in EMOJI_ITER_PATTERN.finditer("🇺🇸")]
         assert len(emojis) == 1
         assert emojis[0] == "🇺🇸"
@@ -250,12 +225,10 @@ class TestRegexPatterns:
         assert "😺" in emojis
 
     def test_iter_adjacent_emoji(self):
-        emojis = [m.group(0) for m in EMOJI_ITER_PATTERN.finditer("😀😺🎉")]
-        assert len(emojis) == 3
+        assert len([m.group(0) for m in EMOJI_ITER_PATTERN.finditer("😀😺🎉")]) == 3
 
     def test_iter_no_emoji(self):
-        emojis = [m.group(0) for m in EMOJI_ITER_PATTERN.finditer("hello world 123")]
-        assert len(emojis) == 0
+        assert len([m.group(0) for m in EMOJI_ITER_PATTERN.finditer("hello world 123")]) == 0
 
 
 # ============================================================
@@ -289,54 +262,53 @@ MOCK_METADATA = {
 # ============================================================
 class TestLookup:
 
-    def test_direct_lookup(self):
-        plugin = _make_plugin(MOCK_METADATA)
-        assert plugin._find_combination("😀", "😺") == "https://www.gstatic.com/emoji/1f600_1f63a.png"
+    def test_direct_lookup(self, plugin_with_meta):
+        assert plugin_with_meta._find_combination("😀", "😺") == "https://www.gstatic.com/emoji/1f600_1f63a.png"
 
-    def test_reverse_lookup(self):
-        plugin = _make_plugin(MOCK_METADATA)
-        assert plugin._find_combination("😺", "😀") == "https://www.gstatic.com/emoji/1f600_1f63a.png"
+    def test_reverse_lookup(self, plugin_with_meta):
+        assert plugin_with_meta._find_combination("😺", "😀") == "https://www.gstatic.com/emoji/1f600_1f63a.png"
 
-    def test_latest_version_preferred(self):
-        plugin = _make_plugin(MOCK_METADATA)
-        assert "old" not in plugin._find_combination("😀", "😺")
+    def test_latest_version_preferred(self, plugin_with_meta):
+        assert "old" not in plugin_with_meta._find_combination("😀", "😺")
 
-    def test_unsupported_combination(self):
-        assert _make_plugin(MOCK_METADATA)._find_combination("😀", "🔥") is None
+    def test_unsupported_combination(self, plugin_with_meta):
+        assert plugin_with_meta._find_combination("😀", "🔥") is None
 
-    def test_no_metadata(self):
-        assert _make_plugin(None)._find_combination("😀", "😺") is None
+    def test_no_metadata(self, plugin):
+        assert plugin._find_combination("😀", "😺") is None
 
-    def test_empty_metadata(self):
-        assert _make_plugin({"data": {}})._find_combination("😀", "😺") is None
+    def test_empty_metadata(self, plugin):
+        plugin.metadata = {"data": {}}
+        assert plugin._find_combination("😀", "😺") is None
 
-    def test_fallback_no_islatest(self):
-        metadata = {"data": {"1f600": {"combinations": {"1f63a": [
+    def test_fallback_no_islatest(self, plugin):
+        plugin.metadata = {"data": {"1f600": {"combinations": {"1f63a": [
             {"gStaticUrl": "https://example.com/first.png", "isLatest": False},
             {"gStaticUrl": "https://example.com/second.png", "isLatest": False},
         ]}}}}
-        assert _make_plugin(metadata)._find_combination("😀", "😺") == "https://example.com/first.png"
+        assert plugin._find_combination("😀", "😺") == "https://example.com/first.png"
 
-    def test_empty_combo_list(self):
-        metadata = {"data": {"1f600": {"combinations": {"1f63a": []}}}}
-        assert _make_plugin(metadata)._find_combination("😀", "😺") is None
+    def test_empty_combo_list(self, plugin):
+        plugin.metadata = {"data": {"1f600": {"combinations": {"1f63a": []}}}}
+        assert plugin._find_combination("😀", "😺") is None
 
-    def test_same_emoji_combination(self):
-        metadata = {"data": {"1f525": {"combinations": {"1f525": [
-            {"gStaticUrl": "https://example.com/fire_fire.png", "isLatest": True}
+    def test_same_emoji_combination(self, plugin):
+        plugin.metadata = {"data": {"1f525": {"combinations": {"1f525": [
+            {"gStaticUrl": "https://example.com/fire.png", "isLatest": True}
         ]}}}}
-        assert _make_plugin(metadata)._find_combination("🔥", "🔥") == "https://example.com/fire_fire.png"
+        assert plugin._find_combination("🔥", "🔥") == "https://example.com/fire.png"
 
-    def test_islatest_without_url_falls_through(self):
+    def test_islatest_without_url_falls_through(self, plugin):
         """isLatest=True 但缺少 gStaticUrl 时，应回退到其他版本"""
-        metadata = {"data": {"1f600": {"combinations": {"1f63a": [
+        plugin.metadata = {"data": {"1f600": {"combinations": {"1f63a": [
             {"isLatest": True},
             {"gStaticUrl": "https://example.com/fallback.png", "isLatest": False},
         ]}}}}
-        assert _make_plugin(metadata)._find_combination("😀", "😺") == "https://example.com/fallback.png"
+        assert plugin._find_combination("😀", "😺") == "https://example.com/fallback.png"
 
-    def test_lookup_missing_combinations_key(self):
-        assert _make_plugin({"data": {"1f600": {"alt": "test"}}})._find_combination("😀", "😺") is None
+    def test_lookup_missing_combinations_key(self, plugin):
+        plugin.metadata = {"data": {"1f600": {"alt": "test"}}}
+        assert plugin._find_combination("😀", "😺") is None
 
 
 # ============================================================
@@ -345,8 +317,7 @@ class TestLookup:
 class TestCacheLogic:
 
     @pytest.mark.asyncio
-    async def test_fresh_cache_skips_download(self):
-        plugin = _make_plugin()
+    async def test_fresh_cache_skips_download(self, plugin):
         plugin._cache_file.write_text(json.dumps(MOCK_METADATA), encoding="utf-8")
         plugin._download_metadata = AsyncMock()
 
@@ -356,8 +327,7 @@ class TestCacheLogic:
         assert plugin.metadata is not None
 
     @pytest.mark.asyncio
-    async def test_expired_cache_triggers_download(self):
-        plugin = _make_plugin()
+    async def test_expired_cache_triggers_download(self, plugin):
         plugin._cache_file.write_text(json.dumps(MOCK_METADATA), encoding="utf-8")
         old_time = plugin._cache_file.stat().st_mtime - (8 * 24 * 3600)
         os.utime(str(plugin._cache_file), (old_time, old_time))
@@ -368,8 +338,7 @@ class TestCacheLogic:
         plugin._download_metadata.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_missing_cache_triggers_download(self):
-        plugin = _make_plugin()
+    async def test_missing_cache_triggers_download(self, plugin):
         if plugin._cache_file.exists():
             plugin._cache_file.unlink()
         plugin._download_metadata = AsyncMock()
@@ -379,23 +348,11 @@ class TestCacheLogic:
         plugin._download_metadata.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_corrupted_cache_triggers_redownload(self):
+    async def test_corrupted_cache_triggers_redownload(self, plugin):
         """损坏的缓存应触发重新下载"""
-        plugin = _make_plugin()
         plugin._cache_file.write_text("NOT VALID JSON {{{", encoding="utf-8")
         plugin._download_metadata = AsyncMock()
 
         await plugin._load_metadata()
 
-        # 应调用 _download_metadata 进行重新下载
         plugin._download_metadata.assert_called_once()
-
-
-# ============================================================
-# Cleanup
-# ============================================================
-def teardown_module():
-    _uninstall_mocks()
-    # 清理测试目录
-    import shutil
-    shutil.rmtree(_TEST_DATA_DIR, ignore_errors=True)
