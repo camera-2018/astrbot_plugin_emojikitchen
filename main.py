@@ -1,13 +1,15 @@
 import os
 import json
 import time
-import regex
+import asyncio
+from pathlib import Path
 
+import regex
 import aiohttp
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.event.filter import EventMessageType
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
 
@@ -17,14 +19,16 @@ METADATA_URLS = [
     "https://gh-proxy.com/https://raw.githubusercontent.com/xsalazar/emoji-kitchen-backend/main/app/metadata.json",
     "https://mirror.ghproxy.com/https://raw.githubusercontent.com/xsalazar/emoji-kitchen-backend/main/app/metadata.json",
 ]
-CACHE_DIR = os.path.join("data", "plugins", "emoji_kitchen")
-CACHE_FILE = os.path.join(CACHE_DIR, "metadata.json")
 CACHE_MAX_AGE = 7 * 24 * 3600  # 7 days
 
-# Regex pattern to match a single emoji (including ZWJ sequences, skin tones, etc.)
+# Regex pattern to match a single emoji (including ZWJ sequences, skin tones,
+# keycaps, flags, tag sequences, etc.)
 SINGLE_EMOJI_RE = (
-    r"(?:\p{Emoji_Presentation}|\p{Emoji}\uFE0F)"
-    r"(?:\u200D(?:\p{Emoji_Presentation}|\p{Emoji}\uFE0F))*"
+    r"(?:"
+    r"(?:\p{Emoji_Presentation}|\p{Emoji}\uFE0F)"  # base emoji
+    r"(?:\u200D(?:\p{Emoji_Presentation}|\p{Emoji}\uFE0F))*"  # ZWJ sequences
+    r"[\U0001F3FB-\U0001F3FF]?"  # optional skin tone modifier
+    r")"
 )
 
 # Compiled patterns
@@ -47,6 +51,11 @@ class EmojiKitchenPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.metadata = None
+        self._download_lock = asyncio.Lock()
+        # 使用框架提供的数据目录
+        self._data_dir = StarTools.get_data_dir("emoji_kitchen")
+        self._cache_file = self._data_dir / "metadata.json"
+        self._img_dir = self._data_dir / "images"
 
     def _get_proxy(self) -> str | None:
         """从环境变量获取 HTTP 代理。
@@ -62,25 +71,25 @@ class EmojiKitchenPlugin(Star):
 
     async def initialize(self):
         """异步初始化：下载或加载 metadata.json"""
-        os.makedirs(CACHE_DIR, exist_ok=True)
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        self._img_dir.mkdir(parents=True, exist_ok=True)
         await self._load_metadata()
 
     async def _load_metadata(self):
         """加载 metadata，优先使用缓存"""
         need_download = True
 
-        if os.path.exists(CACHE_FILE):
-            file_age = time.time() - os.path.getmtime(CACHE_FILE)
+        if self._cache_file.exists():
+            file_age = time.time() - self._cache_file.stat().st_mtime
             if file_age < CACHE_MAX_AGE:
                 need_download = False
 
         if need_download:
             await self._download_metadata()
 
-        if os.path.exists(CACHE_FILE):
+        if self._cache_file.exists():
             try:
-                with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                    self.metadata = json.load(f)
+                self.metadata = json.loads(self._cache_file.read_text(encoding="utf-8"))
                 logger.info(
                     "Emoji Kitchen: metadata loaded, %d supported emoji",
                     len(self.metadata.get("knownSupportedEmoji", [])),
@@ -94,47 +103,48 @@ class EmojiKitchenPlugin(Star):
     async def _download_metadata(self):
         """从多个镜像源尝试下载 metadata.json（8.5MB），带重试和完整性校验"""
         logger.info("Emoji Kitchen: downloading metadata.json ...")
-        tmp_file = CACHE_FILE + ".tmp"
+        tmp_file = str(self._cache_file) + ".tmp"
         timeout = aiohttp.ClientTimeout(total=60, connect=10)
+        proxy = self._get_proxy()
 
-        for url in METADATA_URLS:
-            for attempt in range(1, 4):  # 每个镜像最多重试 3 次
-                try:
-                    logger.info(
-                        "Emoji Kitchen: trying %s (attempt %d/3)",
-                        url.split("/")[2], attempt,
-                    )
-                    async with aiohttp.ClientSession(timeout=timeout) as session:
-                        async with session.get(url, proxy=self._get_proxy()) as resp:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for url in METADATA_URLS:
+                for attempt in range(1, 4):  # 每个镜像最多重试 3 次
+                    try:
+                        logger.info(
+                            "Emoji Kitchen: trying %s (attempt %d/3)",
+                            url.split("/")[2], attempt,
+                        )
+                        async with session.get(url, proxy=proxy) as resp:
                             resp.raise_for_status()
                             # 流式下载，避免大文件占用过多内存
                             with open(tmp_file, "wb") as f:
                                 async for chunk in resp.content.iter_chunked(65536):
                                     f.write(chunk)
 
-                    # 校验 JSON 完整性
-                    with open(tmp_file, "r", encoding="utf-8") as f:
-                        json.load(f)
+                        # 校验 JSON 完整性
+                        with open(tmp_file, "r", encoding="utf-8") as f:
+                            json.load(f)
 
-                    # 原子替换：临时文件 → 正式文件
-                    os.replace(tmp_file, CACHE_FILE)
-                    logger.info("Emoji Kitchen: metadata.json downloaded successfully")
-                    return
+                        # 原子替换：临时文件 → 正式文件
+                        os.replace(tmp_file, str(self._cache_file))
+                        logger.info("Emoji Kitchen: metadata.json downloaded successfully")
+                        return
 
-                except json.JSONDecodeError:
-                    logger.warning("Emoji Kitchen: downloaded file is not valid JSON, retrying...")
-                except Exception as e:
-                    logger.warning(
-                        "Emoji Kitchen: failed from %s (attempt %d): %s",
-                        url.split("/")[2], attempt, e,
-                    )
-                finally:
-                    # 清理残留的临时文件
-                    if os.path.exists(tmp_file):
-                        try:
-                            os.remove(tmp_file)
-                        except OSError:
-                            pass
+                    except json.JSONDecodeError:
+                        logger.warning("Emoji Kitchen: downloaded file is not valid JSON, retrying...")
+                    except Exception as e:
+                        logger.warning(
+                            "Emoji Kitchen: failed from %s (attempt %d): %s",
+                            url.split("/")[2], attempt, e,
+                        )
+                    finally:
+                        # 清理残留的临时文件
+                        if os.path.exists(tmp_file):
+                            try:
+                                os.remove(tmp_file)
+                            except OSError:
+                                pass
 
         logger.error("Emoji Kitchen: all mirror sources failed after retries")
 
@@ -174,14 +184,19 @@ class EmojiKitchenPlugin(Star):
         if not combo_list:
             return None
 
-        # 找到 isLatest=true 的版本
+        # 找到 isLatest=true 且有有效 URL 的版本
         for combo in combo_list:
             if combo.get("isLatest", False):
-                return combo.get("gStaticUrl")
+                url = combo.get("gStaticUrl")
+                if url:
+                    return url
+                # isLatest 但没有 URL，继续遍历其他版本
 
-        # 如果没有标记 isLatest 的，取第一个
-        if combo_list:
-            return combo_list[0].get("gStaticUrl")
+        # 没有有效的 isLatest 版本，取第一个有 URL 的
+        for combo in combo_list:
+            url = combo.get("gStaticUrl")
+            if url:
+                return url
 
         return None
 
@@ -196,48 +211,60 @@ class EmojiKitchenPlugin(Star):
         """
         # 从 URL 提取文件名作为缓存 key
         filename = url.rsplit("/", 1)[-1]
-        img_dir = os.path.join(CACHE_DIR, "images")
-        os.makedirs(img_dir, exist_ok=True)
-        local_path = os.path.join(img_dir, filename)
+        local_path = self._img_dir / filename
 
         # 已缓存则直接返回
-        if os.path.exists(local_path):
-            return local_path
+        if local_path.exists():
+            return str(local_path)
 
-        # 构造镜像 URL 列表
-        # 原始 URL 例：https://www.gstatic.com/android/keyboard/emojikitchen/...
-        stripped = url.replace("https://", "").replace("http://", "")
-        mirror_urls = [
-            url,                                          # 直接下载（走代理）
-            f"https://i0.wp.com/{stripped}",              # WordPress Photon CDN
-            f"https://wsrv.nl/?url={stripped}",            # wsrv.nl 图片代理
-            f"https://images.weserv.nl/?url={stripped}",   # weserv.nl 图片代理
-        ]
+        # 使用异步锁防止并发下载同一文件
+        async with self._download_lock:
+            # double-check：拿到锁后再次检查（可能被其他协程已下载）
+            if local_path.exists():
+                return str(local_path)
 
-        timeout = aiohttp.ClientTimeout(total=15, connect=5)
-        for mirror_url in mirror_urls:
-            try:
-                # 只有直接访问时才使用代理，镜像源不需要
-                proxy = self._get_proxy() if mirror_url == url else None
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(mirror_url, proxy=proxy) as resp:
-                        resp.raise_for_status()
-                        content = await resp.read()
-                        if len(content) < 100:
-                            # 太小的响应可能是错误页面
-                            raise ValueError(f"response too small ({len(content)} bytes)")
-                        with open(local_path, "wb") as f:
-                            f.write(content)
-                        logger.info("Emoji Kitchen: image downloaded from %s", mirror_url.split("?")[0].split("/")[2])
-                        return local_path
-            except Exception as e:
-                logger.warning(
-                    "Emoji Kitchen: image download failed from %s: %s",
-                    mirror_url.split("?")[0].split("/")[2], e,
-                )
+            # 构造镜像 URL 列表
+            stripped = url.replace("https://", "").replace("http://", "")
+            mirror_urls = [
+                url,                                          # 直接下载（走代理）
+                f"https://i0.wp.com/{stripped}",              # WordPress Photon CDN
+                f"https://wsrv.nl/?url={stripped}",            # wsrv.nl 图片代理
+                f"https://images.weserv.nl/?url={stripped}",   # weserv.nl 图片代理
+            ]
 
-        logger.error("Emoji Kitchen: all image sources failed: %s", filename)
-        return None
+            timeout = aiohttp.ClientTimeout(total=15, connect=5)
+            tmp_path = str(local_path) + ".tmp"
+
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                for mirror_url in mirror_urls:
+                    try:
+                        # 只有直接访问时才使用代理，镜像源不需要
+                        proxy = self._get_proxy() if mirror_url == url else None
+                        async with session.get(mirror_url, proxy=proxy) as resp:
+                            resp.raise_for_status()
+                            content = await resp.read()
+                            if len(content) < 100:
+                                raise ValueError(f"response too small ({len(content)} bytes)")
+                            # 原子写入：先写临时文件再替换
+                            with open(tmp_path, "wb") as f:
+                                f.write(content)
+                            os.replace(tmp_path, str(local_path))
+                            logger.info("Emoji Kitchen: image downloaded from %s", mirror_url.split("?")[0].split("/")[2])
+                            return str(local_path)
+                    except Exception as e:
+                        logger.warning(
+                            "Emoji Kitchen: image download failed from %s: %s",
+                            mirror_url.split("?")[0].split("/")[2], e,
+                        )
+                        # 清理临时文件
+                        if os.path.exists(tmp_path):
+                            try:
+                                os.remove(tmp_path)
+                            except OSError:
+                                pass
+
+            logger.error("Emoji Kitchen: all image sources failed: %s", filename)
+            return None
 
     @filter.command("mix")
     async def mix_command(self, event: AstrMessageEvent):
@@ -300,4 +327,3 @@ class EmojiKitchenPlugin(Star):
     async def terminate(self):
         """插件卸载时的清理"""
         pass
-
