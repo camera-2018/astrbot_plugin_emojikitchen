@@ -356,14 +356,14 @@ class TestAutoMixSelfIgnore:
         plugin_with_meta._download_image.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_process_other_message(self, plugin_with_meta):
+    async def test_process_other_message(self, plugin_with_meta, tmp_path):
         mock_event = MagicMock()
         mock_event.message_str = "😀😺"
         mock_event.message_obj.sender.user_id = "user_456"
         mock_event.message_obj.self_id = "bot_123"
         mock_event.chain_result = lambda c: c
 
-        plugin_with_meta._download_image = AsyncMock(return_value="/tmp/path")
+        plugin_with_meta._download_image = AsyncMock(return_value=str(tmp_path / "emoji.png"))
 
         results = []
         async for r in plugin_with_meta.auto_mix(mock_event):
