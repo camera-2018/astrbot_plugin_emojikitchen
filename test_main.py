@@ -7,7 +7,7 @@ Emoji Kitchen Plugin - Unit Tests
 
 import json
 import os
-import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -27,8 +27,8 @@ class _FakeContext:
     pass
 
 
-# get_data_dir 返回的路径会在 fixture 中被覆盖
-_fake_data_dir = Path("/tmp/_emoji_kitchen_unused")
+# get_data_dir 返回的路径会在 fixture 中被覆盖（使用跨平台临时目录）
+_fake_data_dir = Path(tempfile.gettempdir()) / "_emoji_kitchen_unused"
 
 _star_module = MagicMock()
 _star_module.Star = _FakeStar
@@ -61,10 +61,12 @@ with patch.dict("sys.modules", _MOCKS):
     from main import (
         emoji_to_codepoint,
         _url_to_cache_filename,
+        _is_allowed_image_url,
         EMOJI_ITER_PATTERN,
         TWO_EMOJI_MSG_PATTERN,
         EmojiKitchenPlugin,
     )
+    import main as _main_module
 
 
 # ============================================================
@@ -356,3 +358,227 @@ class TestCacheLogic:
         await plugin._load_metadata()
 
         plugin._download_metadata.assert_called_once()
+
+
+# ============================================================
+# Test: _is_allowed_image_url (SSRF protection)
+# ============================================================
+class TestIsAllowedImageUrl:
+
+    def test_allowed_www_gstatic(self):
+        assert _is_allowed_image_url("https://www.gstatic.com/emoji/foo.png") is True
+
+    def test_allowed_gstatic_subdomain(self):
+        assert _is_allowed_image_url("https://fonts.gstatic.com/emoji/foo.png") is True
+
+    def test_allowed_arbitrary_gstatic_subdomain(self):
+        assert _is_allowed_image_url("https://emoji.gstatic.com/foo.png") is True
+
+    def test_rejected_http_scheme(self):
+        assert _is_allowed_image_url("http://www.gstatic.com/emoji/foo.png") is False
+
+    def test_rejected_unknown_domain(self):
+        assert _is_allowed_image_url("https://evil.com/foo.png") is False
+
+    def test_rejected_internal_ip(self):
+        assert _is_allowed_image_url("https://192.168.1.1/foo.png") is False
+
+    def test_rejected_localhost(self):
+        assert _is_allowed_image_url("https://localhost/foo.png") is False
+
+    def test_rejected_gstatic_lookalike(self):
+        """域名伪装为 gstatic.com 的子串不应通过"""
+        assert _is_allowed_image_url("https://evil-gstatic.com/foo.png") is False
+
+    def test_rejected_empty_string(self):
+        assert _is_allowed_image_url("") is False
+
+    def test_rejected_ftp_scheme(self):
+        assert _is_allowed_image_url("ftp://www.gstatic.com/foo.png") is False
+
+
+# ============================================================
+# Test: _url_to_cache_filename — query-string safety
+# ============================================================
+class TestUrlToCacheFilenameQueryString:
+
+    def test_query_string_not_in_extension(self):
+        name = _url_to_cache_filename("https://www.gstatic.com/a.png?x=1")
+        assert "?" not in name
+        assert name.endswith(".png")
+
+    def test_fragment_not_in_extension(self):
+        name = _url_to_cache_filename("https://www.gstatic.com/a.webp#section")
+        assert "#" not in name
+        assert name.endswith(".webp")
+
+
+# ============================================================
+# Test: mix_command emoji count validation
+# ============================================================
+class TestMixCommandEmojiCount:
+
+    @pytest.mark.asyncio
+    async def test_mix_exactly_two_emoji_proceeds(self, plugin_with_meta):
+        """两个 emoji 时命令应尝试合成（不因数量返回错误）"""
+        mock_event = MagicMock()
+        mock_event.message_str = "😀😺"
+        mock_event.plain_result = lambda msg: msg
+        mock_event.chain_result = lambda chain: chain
+
+        plugin_with_meta._download_image = AsyncMock(return_value=None)
+        results = []
+        async for r in plugin_with_meta.mix_command(mock_event):
+            results.append(r)
+
+        # Should not get "恰好两个" error; may get download-failure message instead
+        assert all("恰好两个" not in str(r) for r in results)
+
+    @pytest.mark.asyncio
+    async def test_mix_three_emoji_returns_error(self, plugin_with_meta):
+        """三个 emoji 时应返回提示，不静默截断"""
+        mock_event = MagicMock()
+        mock_event.message_str = "😀😺🎉"
+        mock_event.plain_result = lambda msg: msg
+
+        results = []
+        async for r in plugin_with_meta.mix_command(mock_event):
+            results.append(r)
+
+        assert len(results) == 1
+        assert "恰好两个" in results[0]
+
+    @pytest.mark.asyncio
+    async def test_mix_one_emoji_returns_error(self, plugin_with_meta):
+        """一个 emoji 时同样返回提示"""
+        mock_event = MagicMock()
+        mock_event.message_str = "😀"
+        mock_event.plain_result = lambda msg: msg
+
+        results = []
+        async for r in plugin_with_meta.mix_command(mock_event):
+            results.append(r)
+
+        assert len(results) == 1
+        assert "恰好两个" in results[0]
+
+
+# ============================================================
+# Helpers for async download tests
+# ============================================================
+def _make_resp_mock(content_type="image/png", chunks=(b"x" * 200,), raise_on_raise_for_status=False):
+    resp = MagicMock()
+    resp.content_type = content_type
+    if raise_on_raise_for_status:
+        resp.raise_for_status = MagicMock(side_effect=Exception("HTTP error"))
+    else:
+        resp.raise_for_status = MagicMock()
+
+    async def _iter_chunked(size):
+        for chunk in chunks:
+            yield chunk
+
+    resp.content = MagicMock()
+    resp.content.iter_chunked = _iter_chunked
+    resp.__aenter__ = AsyncMock(return_value=resp)
+    resp.__aexit__ = AsyncMock(return_value=None)
+    return resp
+
+
+def _make_session_mock(resp):
+    session = MagicMock()
+    session.get = MagicMock(return_value=resp)
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=None)
+    return session
+
+
+# ============================================================
+# Test: _download_image async behaviour
+# ============================================================
+class TestDownloadImage:
+
+    @pytest.mark.asyncio
+    async def test_ssrf_blocked_url_returns_none(self, plugin):
+        """非 gstatic.com URL 应被拒绝，不发出任何 HTTP 请求"""
+        result = await plugin._download_image("https://evil.com/foo.png")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_ssrf_http_scheme_blocked(self, plugin):
+        result = await plugin._download_image("http://www.gstatic.com/emoji/foo.png")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_cached_file_returned_without_download(self, plugin):
+        """已缓存文件直接返回，不触发下载"""
+        url = "https://www.gstatic.com/emoji/1f600_1f63a.png"
+        cached = plugin._img_dir / _url_to_cache_filename(url)
+        cached.write_bytes(b"fake")
+
+        result = await plugin._download_image(url)
+        assert result == str(cached)
+
+    @pytest.mark.asyncio
+    async def test_successful_download_creates_file(self, plugin):
+        url = "https://www.gstatic.com/emoji/1f600_1f63a.png"
+        resp = _make_resp_mock(chunks=(b"x" * 200,))
+        session = _make_session_mock(resp)
+
+        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
+            result = await plugin._download_image(url)
+
+        assert result is not None
+        assert Path(result).exists()
+
+    @pytest.mark.asyncio
+    async def test_too_large_response_returns_none(self, plugin):
+        """超过 MAX_IMAGE_BYTES 的响应应被拒绝"""
+        url = "https://www.gstatic.com/emoji/big.png"
+        large_chunk = b"x" * (_main_module.MAX_IMAGE_BYTES + 1)
+        resp = _make_resp_mock(chunks=(large_chunk,))
+        session = _make_session_mock(resp)
+
+        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
+            result = await plugin._download_image(url)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_wrong_content_type_returns_none(self, plugin):
+        """非图片 Content-Type 应被拒绝"""
+        url = "https://www.gstatic.com/emoji/bad.png"
+        resp = _make_resp_mock(content_type="text/html", chunks=(b"x" * 200,))
+        session = _make_session_mock(resp)
+
+        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
+            result = await plugin._download_image(url)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_lock_cleaned_up_after_success(self, plugin):
+        """下载成功后锁映射中不应残留条目"""
+        url = "https://www.gstatic.com/emoji/1f600_1f63a.png"
+        resp = _make_resp_mock(chunks=(b"x" * 200,))
+        session = _make_session_mock(resp)
+
+        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
+            await plugin._download_image(url)
+
+        filename = _url_to_cache_filename(url)
+        assert filename not in plugin._download_locks
+
+    @pytest.mark.asyncio
+    async def test_lock_cleaned_up_after_all_mirrors_fail(self, plugin):
+        """所有镜像失败后锁映射中不应残留条目"""
+        url = "https://www.gstatic.com/emoji/fail.png"
+        resp = _make_resp_mock(raise_on_raise_for_status=True)
+        session = _make_session_mock(resp)
+
+        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
+            result = await plugin._download_image(url)
+
+        assert result is None
+        filename = _url_to_cache_filename(url)
+        assert filename not in plugin._download_locks
