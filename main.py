@@ -106,6 +106,7 @@ class EmojiKitchenPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.metadata = None
+        self.session = None
         # 按文件名分段锁，避免全局锁阻塞不相关下载；下载完成后清理
         self._download_locks: dict[str, asyncio.Lock] = {}
         # 使用框架提供的数据目录
@@ -125,6 +126,7 @@ class EmojiKitchenPlugin(Star):
         """异步初始化：下载或加载 metadata.json"""
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._img_dir.mkdir(parents=True, exist_ok=True)
+        self.session = aiohttp.ClientSession()
         await self._load_metadata()
 
     async def _load_metadata(self):
@@ -176,47 +178,46 @@ class EmojiKitchenPlugin(Star):
         timeout = aiohttp.ClientTimeout(total=60, connect=10)
         proxy = self._get_proxy()
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            for url in METADATA_URLS:
-                for attempt in range(1, 4):
-                    try:
-                        logger.info(
-                            "Emoji Kitchen: trying %s (attempt %d/3)",
-                            url.split("/")[2], attempt,
-                        )
-                        async with session.get(url, proxy=proxy) as resp:
-                            resp.raise_for_status()
-                            total_meta = 0
-                            with open(tmp_file, "wb") as f:
-                                async for chunk in resp.content.iter_chunked(65536):
-                                    total_meta += len(chunk)
-                                    if total_meta > MAX_METADATA_BYTES:
-                                        raise ValueError(
-                                            f"metadata too large (>{MAX_METADATA_BYTES} bytes)"
-                                        )
-                                    f.write(chunk)
+        for url in METADATA_URLS:
+            for attempt in range(1, 4):
+                try:
+                    logger.info(
+                        "Emoji Kitchen: trying %s (attempt %d/3)",
+                        url.split("/")[2], attempt,
+                    )
+                    async with self.session.get(url, proxy=proxy, timeout=timeout) as resp:
+                        resp.raise_for_status()
+                        total_meta = 0
+                        with open(tmp_file, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(65536):
+                                total_meta += len(chunk)
+                                if total_meta > MAX_METADATA_BYTES:
+                                    raise ValueError(
+                                        f"metadata too large (>{MAX_METADATA_BYTES} bytes)"
+                                    )
+                                f.write(chunk)
 
-                        # 校验 JSON 完整性
-                        with open(tmp_file, "r", encoding="utf-8") as f:
-                            json.load(f)
+                    # 校验 JSON 完整性
+                    with open(tmp_file, "r", encoding="utf-8") as f:
+                        json.load(f)
 
-                        os.replace(tmp_file, str(self._cache_file))
-                        logger.info("Emoji Kitchen: metadata.json downloaded successfully")
-                        return
+                    os.replace(tmp_file, str(self._cache_file))
+                    logger.info("Emoji Kitchen: metadata.json downloaded successfully")
+                    return
 
-                    except json.JSONDecodeError:
-                        logger.warning("Emoji Kitchen: downloaded file is not valid JSON, retrying...")
-                    except Exception as e:
-                        logger.warning(
-                            "Emoji Kitchen: failed from %s (attempt %d): %s",
-                            url.split("/")[2], attempt, e,
-                        )
-                    finally:
-                        if os.path.exists(tmp_file):
-                            try:
-                                os.remove(tmp_file)
-                            except OSError:
-                                pass
+                except json.JSONDecodeError:
+                    logger.warning("Emoji Kitchen: downloaded file is not valid JSON, retrying...")
+                except Exception as e:
+                    logger.warning(
+                        "Emoji Kitchen: failed from %s (attempt %d): %s",
+                        url.split("/")[2], attempt, e,
+                    )
+                finally:
+                    if os.path.exists(tmp_file):
+                        try:
+                            os.remove(tmp_file)
+                        except OSError:
+                            pass
 
         logger.error("Emoji Kitchen: all mirror sources failed after retries")
 
@@ -311,58 +312,57 @@ class EmojiKitchenPlugin(Star):
             timeout = aiohttp.ClientTimeout(total=15, connect=5)
             tmp_path = str(local_path) + ".tmp"
 
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                for mirror_url in mirror_urls:
-                    try:
-                        proxy = self._get_proxy() if mirror_url == url else None
-                        async with session.get(mirror_url, proxy=proxy) as resp:
-                            resp.raise_for_status()
+            for mirror_url in mirror_urls:
+                try:
+                    proxy = self._get_proxy() if mirror_url == url else None
+                    async with self.session.get(mirror_url, proxy=proxy, timeout=timeout) as resp:
+                        resp.raise_for_status()
 
-                            # SSRF 防护：校验重定向后的最终 URL（仅针对直连分支）
-                            if mirror_url == url:
-                                final_url = str(resp.url)
-                                if not _is_allowed_image_url(final_url):
-                                    raise ValueError(
-                                        f"redirect to disallowed host: {final_url}"
-                                    )
+                        # SSRF 防护：校验重定向后的最终 URL（仅针对直连分支）
+                        if mirror_url == url:
+                            final_url = str(resp.url)
+                            if not _is_allowed_image_url(final_url):
+                                raise ValueError(
+                                    f"redirect to disallowed host: {final_url}"
+                                )
 
-                            # 校验 Content-Type（空值视为不合法，不放行）
-                            content_type = resp.content_type or ""
-                            if not content_type or content_type not in IMAGE_CONTENT_TYPES:
-                                raise ValueError(f"unexpected content-type: {content_type!r}")
+                        # 校验 Content-Type（空值视为不合法，不放行）
+                        content_type = resp.content_type or ""
+                        if not content_type or content_type not in IMAGE_CONTENT_TYPES:
+                            raise ValueError(f"unexpected content-type: {content_type!r}")
 
-                            # 分块读取，防止超大响应占满内存
-                            chunks = []
-                            total = 0
-                            async for chunk in resp.content.iter_chunked(65536):
-                                total += len(chunk)
-                                if total > MAX_IMAGE_BYTES:
-                                    raise ValueError(f"response too large (>{MAX_IMAGE_BYTES} bytes)")
-                                chunks.append(chunk)
-                            content = b"".join(chunks)
+                        # 分块读取，防止超大响应占满内存
+                        chunks = []
+                        total = 0
+                        async for chunk in resp.content.iter_chunked(65536):
+                            total += len(chunk)
+                            if total > MAX_IMAGE_BYTES:
+                                raise ValueError(f"response too large (>{MAX_IMAGE_BYTES} bytes)")
+                            chunks.append(chunk)
+                        content = b"".join(chunks)
 
-                            if len(content) < 100:
-                                raise ValueError(f"response too small ({len(content)} bytes)")
+                        if len(content) < 100:
+                            raise ValueError(f"response too small ({len(content)} bytes)")
 
-                            # 文件头（magic number）校验，防止非图片内容被缓存
-                            if not _is_valid_image_magic(content):
-                                raise ValueError("invalid image magic number")
+                        # 文件头（magic number）校验，防止非图片内容被缓存
+                        if not _is_valid_image_magic(content):
+                            raise ValueError("invalid image magic number")
 
-                            with open(tmp_path, "wb") as f:
-                                f.write(content)
-                            os.replace(tmp_path, str(local_path))
-                            logger.info("Emoji Kitchen: image downloaded from %s", mirror_url.split("?")[0].split("/")[2])
-                            return str(local_path)
-                    except Exception as e:
-                        logger.warning(
-                            "Emoji Kitchen: image download failed from %s: %s",
-                            mirror_url.split("?")[0].split("/")[2], e,
-                        )
-                        if os.path.exists(tmp_path):
-                            try:
-                                os.remove(tmp_path)
-                            except OSError:
-                                pass
+                        with open(tmp_path, "wb") as f:
+                            f.write(content)
+                        os.replace(tmp_path, str(local_path))
+                        logger.info("Emoji Kitchen: image downloaded from %s", mirror_url.split("?")[0].split("/")[2])
+                        return str(local_path)
+                except Exception as e:
+                    logger.warning(
+                        "Emoji Kitchen: image download failed from %s: %s",
+                        mirror_url.split("?")[0].split("/")[2], e,
+                    )
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
 
             logger.error("Emoji Kitchen: all image sources failed: %s", filename)
             return None
@@ -430,4 +430,5 @@ class EmojiKitchenPlugin(Star):
 
     async def terminate(self):
         """插件卸载时的清理"""
-        pass
+        if self.session:
+            await self.session.close()

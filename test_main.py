@@ -49,6 +49,7 @@ _filter_module.EventMessageType = MagicMock()
 
 _MOCKS = {
     "aiohttp": MagicMock(),
+    "regex": MagicMock(),
     "astrbot": MagicMock(),
     "astrbot.api": MagicMock(),
     "astrbot.api.event": _event_module,
@@ -84,6 +85,7 @@ def plugin(tmp_path):
     p._cache_file = tmp_path / "metadata.json"
     p._img_dir = img_dir
     p.metadata = None
+    p.session = MagicMock()
     return p
 
 
@@ -538,8 +540,8 @@ class TestDownloadImage:
         resp = _make_resp_mock(chunks=(png_magic,))
         session = _make_session_mock(resp)
 
-        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
-            result = await plugin._download_image(url)
+        plugin.session = session
+        result = await plugin._download_image(url)
 
         assert result is not None
         assert Path(result).exists()
@@ -552,8 +554,8 @@ class TestDownloadImage:
         resp = _make_resp_mock(chunks=(large_chunk,))
         session = _make_session_mock(resp)
 
-        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
-            result = await plugin._download_image(url)
+        plugin.session = session
+        result = await plugin._download_image(url)
 
         assert result is None
 
@@ -564,8 +566,8 @@ class TestDownloadImage:
         resp = _make_resp_mock(content_type="text/html", chunks=(b"x" * 200,))
         session = _make_session_mock(resp)
 
-        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
-            result = await plugin._download_image(url)
+        plugin.session = session
+        result = await plugin._download_image(url)
 
         assert result is None
 
@@ -576,8 +578,8 @@ class TestDownloadImage:
         resp = _make_resp_mock(content_type="", chunks=(b"x" * 200,))
         session = _make_session_mock(resp)
 
-        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
-            result = await plugin._download_image(url)
+        plugin.session = session
+        result = await plugin._download_image(url)
 
         assert result is None
 
@@ -590,8 +592,8 @@ class TestDownloadImage:
         resp = _make_resp_mock(chunks=(png_magic,))
         session = _make_session_mock(resp)
 
-        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
-            await plugin._download_image(url)
+        plugin.session = session
+        await plugin._download_image(url)
 
         filename = _url_to_cache_filename(url)
         assert filename in plugin._download_locks
@@ -603,8 +605,8 @@ class TestDownloadImage:
         resp = _make_resp_mock(raise_on_raise_for_status=True)
         session = _make_session_mock(resp)
 
-        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
-            result = await plugin._download_image(url)
+        plugin.session = session
+        result = await plugin._download_image(url)
 
         assert result is None
         filename = _url_to_cache_filename(url)
@@ -700,8 +702,8 @@ class TestDownloadImageRedirect:
         # All mirrors fail → overall result is None
         session = _make_call_count_session(direct_resp)
 
-        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
-            result = await plugin._download_image(url)
+        plugin.session = session
+        result = await plugin._download_image(url)
 
         assert result is None
 
@@ -716,8 +718,8 @@ class TestDownloadImageRedirect:
         )
         session = _make_session_mock(resp)
 
-        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
-            result = await plugin._download_image(url)
+        plugin.session = session
+        result = await plugin._download_image(url)
 
         assert result is not None
 
@@ -731,8 +733,8 @@ class TestDownloadImageRedirect:
         )
         session = _make_call_count_session(direct_resp)
 
-        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
-            result = await plugin._download_image(url)
+        plugin.session = session
+        result = await plugin._download_image(url)
 
         assert result is None
 
@@ -749,8 +751,8 @@ class TestDownloadImageMagicNumber:
         resp = _make_resp_mock(chunks=(b'x' * 300,))
         session = _make_session_mock(resp)
 
-        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
-            result = await plugin._download_image(url)
+        plugin.session = session
+        result = await plugin._download_image(url)
 
         assert result is None
 
@@ -761,8 +763,8 @@ class TestDownloadImageMagicNumber:
         resp = _make_resp_mock(chunks=(b'<html>' + b'x' * 300,))
         session = _make_session_mock(resp)
 
-        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
-            result = await plugin._download_image(url)
+        plugin.session = session
+        result = await plugin._download_image(url)
 
         assert result is None
 
@@ -788,12 +790,12 @@ class TestConcurrentDownload:
         resp.content.iter_chunked = _counted_iter_chunked
         session = _make_session_mock(resp)
 
-        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
-            results = await asyncio.gather(
-                plugin._download_image(url),
-                plugin._download_image(url),
-                plugin._download_image(url),
-            )
+        plugin.session = session
+        results = await asyncio.gather(
+            plugin._download_image(url),
+            plugin._download_image(url),
+            plugin._download_image(url),
+        )
 
         assert all(r is not None for r in results)
         assert download_count == 1, f"expected 1 download, got {download_count}"
@@ -806,8 +808,8 @@ class TestConcurrentDownload:
         resp = _make_resp_mock(chunks=(png_data,))
         session = _make_session_mock(resp)
 
-        with patch.object(_main_module.aiohttp, "ClientSession", return_value=session):
-            result1 = await plugin._download_image(url)
+        plugin.session = session
+        result1 = await plugin._download_image(url)
 
         # Second call must use cache
         result2 = await plugin._download_image(url)
