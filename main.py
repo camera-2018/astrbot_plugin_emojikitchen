@@ -4,7 +4,7 @@ import time
 import asyncio
 import hashlib
 import weakref
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import regex
 import aiohttp
@@ -78,7 +78,10 @@ def _is_valid_image_magic(data: bytes) -> bool:
 
 
 def _is_allowed_image_url(url: str) -> bool:
-    """SSRF guard: 仅允许 HTTPS 协议且域名属于 *.gstatic.com 或可信镜像源。"""
+    """SSRF guard: 仅允许 HTTPS 协议且域名属于 *.gstatic.com 或可信镜像源。
+
+    对于可信镜像源，还会校验其 url 参数只能指向 *.gstatic.com，防止 SSRF 攻击。
+    """
     try:
         parsed = urlparse(url)
     except Exception:
@@ -88,7 +91,35 @@ def _is_allowed_image_url(url: str) -> bool:
     host = parsed.netloc.lower().split(":")[0]  # 去除端口
     if host == "www.gstatic.com" or host.endswith(_ALLOWED_IMAGE_HOST_SUFFIX):
         return True
-    return host in _TRUSTED_MIRRORS
+    if host in _TRUSTED_MIRRORS:
+        return _is_mirror_target_allowed(parsed)
+    return False
+
+
+def _is_mirror_target_allowed(parsed) -> bool:
+    """校验镜像 URL 的目标参数只能指向 *.gstatic.com。"""
+    host = parsed.netloc.lower().split(":")[0]
+    # i0.wp.com 使用路径方式代理：https://i0.wp.com/www.gstatic.com/...
+    if host == "i0.wp.com":
+        # 路径第一段应为 gstatic.com 域名
+        path_parts = parsed.path.lstrip("/").split("/", 1)
+        target_host = path_parts[0].lower() if path_parts else ""
+        return target_host == "www.gstatic.com" or target_host.endswith(_ALLOWED_IMAGE_HOST_SUFFIX)
+    # wsrv.nl / images.weserv.nl 使用 ?url= 参数代理
+    qs = parse_qs(parsed.query)
+    url_params = qs.get("url", [])
+    if not url_params:
+        return False
+    target = url_params[0]
+    # 目标可能带或不带 scheme
+    if "://" not in target:
+        target = "https://" + target
+    try:
+        target_parsed = urlparse(target)
+    except Exception:
+        return False
+    target_host = target_parsed.netloc.lower().split(":")[0]
+    return target_host == "www.gstatic.com" or target_host.endswith(_ALLOWED_IMAGE_HOST_SUFFIX)
 
 
 def emoji_to_codepoint(emoji_char: str) -> str:
@@ -117,6 +148,7 @@ class EmojiKitchenPlugin(Star):
         # 按文件名分段锁，避免全局锁阻塞不相关下载；下载完成后清理（自动回收）
         self._download_locks = weakref.WeakValueDictionary()
         self.session: aiohttp.ClientSession | None = None
+        self._metadata_lock = asyncio.Lock()
         # 使用框架提供的数据目录
         self._data_dir = StarTools.get_data_dir("emoji_kitchen")
         self._cache_file = self._data_dir / "metadata.json"
@@ -132,6 +164,8 @@ class EmojiKitchenPlugin(Star):
 
     async def initialize(self):
         """异步初始化：下载或加载 metadata.json"""
+        if self.session and not self.session.closed:
+            await self.session.close()
         self.session = aiohttp.ClientSession()
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._img_dir.mkdir(parents=True, exist_ok=True)
@@ -139,6 +173,11 @@ class EmojiKitchenPlugin(Star):
 
     async def _load_metadata(self):
         """加载 metadata，优先使用缓存。缓存损坏时自动重新下载。"""
+        async with self._metadata_lock:
+            await self._load_metadata_unlocked()
+
+    async def _load_metadata_unlocked(self):
+        """加载 metadata 的实际逻辑（需在 _metadata_lock 保护下调用）。"""
         need_download = True
 
         if self._cache_file.exists():
@@ -168,10 +207,10 @@ class EmojiKitchenPlugin(Star):
                         self.metadata = json.loads(self._cache_file.read_text(encoding="utf-8"))
                         logger.info("Emoji Kitchen: metadata re-loaded after re-download")
                     except Exception:
-                        logger.error("Emoji Kitchen: metadata still corrupted after re-download")
+                        logger.exception("Emoji Kitchen: metadata still corrupted after re-download")
                         self.metadata = None
             except Exception as e:
-                logger.error("Emoji Kitchen: failed to load metadata: %s", e)
+                logger.exception("Emoji Kitchen: failed to load metadata: %s", e)
                 self.metadata = None
         else:
             logger.error("Emoji Kitchen: metadata.json not found")

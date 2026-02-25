@@ -5,13 +5,10 @@ Emoji Kitchen Plugin - Unit Tests
 """
 
 import asyncio
-import json
-import os
 import tempfile
-import weakref
 import gc
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -19,8 +16,7 @@ import pytest
 # Mock astrbot & aiohttp setup
 # ============================================================
 
-_fake_data_dir = Path(tempfile.gettempdir()) / "_emoji_kitchen_test_data"
-_fake_data_dir.mkdir(parents=True, exist_ok=True)
+_fake_data_dir = Path(tempfile.mkdtemp(prefix="_emoji_kitchen_test_data_"))
 
 class _FakeStar:
     def __init__(self, context):
@@ -62,6 +58,7 @@ with patch.dict("sys.modules", _MOCKS):
         emoji_to_codepoint,
         _url_to_cache_filename,
         _is_allowed_image_url,
+        _is_mirror_target_allowed,
         _is_valid_image_magic,
         EMOJI_ITER_PATTERN,
         TWO_EMOJI_MSG_PATTERN,
@@ -138,18 +135,6 @@ def _make_resp_mock(
     resp.__aexit__ = AsyncMock(return_value=None)
     return resp
 
-def _make_session_get_mock(resp_or_map):
-    """
-    resp_or_map: either a single resp mock, or a dict {url: resp_mock}
-    """
-    def get(url, **kwargs):
-        if isinstance(resp_or_map, dict):
-            r = resp_or_map.get(url)
-            return r if r else _make_resp_mock(raise_on_raise_for_status=True)
-        return resp_or_map
-
-    return MagicMock(side_effect=get)
-
 
 # ============================================================
 # Tests: SSRF & URL Safety
@@ -159,15 +144,30 @@ class TestUrlSafety:
     def test_allowed_domains(self):
         assert _is_allowed_image_url("https://www.gstatic.com/a.png")
         assert _is_allowed_image_url("https://fonts.gstatic.com/a.png")
-        assert _is_allowed_image_url("https://i0.wp.com/example.com/a.png")
-        assert _is_allowed_image_url("https://wsrv.nl/?url=a.png")
-        assert _is_allowed_image_url("https://images.weserv.nl/?url=a.png")
+        assert _is_allowed_image_url("https://i0.wp.com/www.gstatic.com/a.png")
+        assert _is_allowed_image_url("https://wsrv.nl/?url=www.gstatic.com/a.png")
+        assert _is_allowed_image_url("https://images.weserv.nl/?url=www.gstatic.com/a.png")
 
     def test_disallowed_domains(self):
         assert not _is_allowed_image_url("https://evil.com/a.png")
         assert not _is_allowed_image_url("http://www.gstatic.com/a.png")
         assert not _is_allowed_image_url("https://192.168.1.1/a.png")
         assert not _is_allowed_image_url("https://localhost/a.png")
+
+    def test_mirror_ssrf_blocked(self):
+        """Mirror URLs pointing to non-gstatic targets must be blocked."""
+        assert not _is_allowed_image_url("https://wsrv.nl/?url=https://internal.corp/secret")
+        assert not _is_allowed_image_url("https://wsrv.nl/?url=http://192.168.1.1/a.png")
+        assert not _is_allowed_image_url("https://images.weserv.nl/?url=evil.com/a.png")
+        assert not _is_allowed_image_url("https://i0.wp.com/evil.com/a.png")
+        # No url param at all
+        assert not _is_allowed_image_url("https://wsrv.nl/")
+
+    def test_mirror_gstatic_target_allowed(self):
+        """Mirror URLs pointing to *.gstatic.com targets must be allowed."""
+        assert _is_allowed_image_url("https://wsrv.nl/?url=https://www.gstatic.com/emoji/test.png")
+        assert _is_allowed_image_url("https://images.weserv.nl/?url=www.gstatic.com/emoji/test.png")
+        assert _is_allowed_image_url("https://i0.wp.com/www.gstatic.com/emoji/test.png")
 
 
 # ============================================================
@@ -190,7 +190,7 @@ class TestDownloadImage:
     @pytest.mark.asyncio
     async def test_download_ssrf_blocked_redirect(self, plugin):
         """Test that redirect to a disallowed host is blocked"""
-        url = "https://wsrv.nl/?url=test.png"
+        url = "https://wsrv.nl/?url=www.gstatic.com/emoji/test.png"
         # Mock response that claims to be from wsrv.nl but redirected to internal IP
         resp = _make_resp_mock(final_url="http://192.168.1.1/test.png")
         plugin.session.get.return_value = resp
@@ -201,7 +201,7 @@ class TestDownloadImage:
     @pytest.mark.asyncio
     async def test_download_ssrf_allowed_mirror_redirect(self, plugin):
         """Test that redirect to another allowed mirror or gstatic is allowed"""
-        url = "https://wsrv.nl/?url=test.png"
+        url = "https://wsrv.nl/?url=www.gstatic.com/emoji/test.png"
         # Redirects to gstatic is fine
         resp = _make_resp_mock(final_url="https://www.gstatic.com/emoji/test.png")
         plugin.session.get.return_value = resp
@@ -272,6 +272,24 @@ class TestSessionLifecycle:
 
         mock_aiohttp.ClientSession.assert_called_once()
         assert plugin.session is not None
+
+    @pytest.mark.asyncio
+    async def test_initialize_closes_old_session(self, plugin):
+        """Re-initializing should close the previous session to prevent leaks."""
+        old_session = MagicMock()
+        old_session.closed = False
+        old_session.close = AsyncMock()
+        plugin.session = old_session
+        plugin._download_metadata = AsyncMock()
+
+        mock_aiohttp = _main_module.aiohttp
+        mock_aiohttp.ClientSession.reset_mock()
+        mock_aiohttp.ClientSession.return_value = MagicMock()
+
+        await plugin.initialize()
+
+        old_session.close.assert_called_once()
+        assert plugin.session is not old_session
 
     @pytest.mark.asyncio
     async def test_terminate_closes_session(self, plugin):
@@ -362,3 +380,39 @@ class TestRegex:
         assert TWO_EMOJI_MSG_PATTERN.match("😀😺")
         assert TWO_EMOJI_MSG_PATTERN.match("😀 😺")
         assert not TWO_EMOJI_MSG_PATTERN.match("😀😺 a")
+
+
+# ============================================================
+# Tests: Metadata Lock
+# ============================================================
+
+class TestMetadataLock:
+    @pytest.mark.asyncio
+    async def test_metadata_lock_exists(self, plugin):
+        """Plugin should have a metadata lock for concurrency protection."""
+        assert hasattr(plugin, '_metadata_lock')
+        assert isinstance(plugin._metadata_lock, asyncio.Lock)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_load_metadata_serialized(self, plugin):
+        """Concurrent _load_metadata calls should be serialized by the lock."""
+        call_order = []
+
+        async def mock_download():
+            call_order.append("download_start")
+            await asyncio.sleep(0.05)
+            call_order.append("download_end")
+
+        plugin._download_metadata = mock_download
+        plugin._cache_file = plugin._data_dir / "nonexistent.json"
+
+        await asyncio.gather(
+            plugin._load_metadata(),
+            plugin._load_metadata(),
+        )
+
+        # With the lock, downloads should be serialized (start/end/start/end)
+        assert call_order == [
+            "download_start", "download_end",
+            "download_start", "download_end",
+        ]
