@@ -144,12 +144,7 @@ def _make_session_get_mock(resp_or_map):
     """
     def get(url, **kwargs):
         if isinstance(resp_or_map, dict):
-            # Try exact match or match base url
             r = resp_or_map.get(url)
-            if not r:
-                # Basic fallback for mirror URL logic
-                # If url is a mirror url, maybe we have a mock for it?
-                pass
             return r if r else _make_resp_mock(raise_on_raise_for_status=True)
         return resp_or_map
 
@@ -236,6 +231,18 @@ class TestDownloadImage:
     async def test_magic_number_check_fail(self, plugin):
         url = "https://www.gstatic.com/emoji/bad.png"
         chunks = [b'BADMAGIC' + b'x' * 100]
+        resp = _make_resp_mock(chunks=chunks)
+        plugin.session.get.return_value = resp
+
+        path = await plugin._download_image(url)
+        assert path is None
+
+    @pytest.mark.asyncio
+    async def test_magic_number_check_small_first_chunk(self, plugin):
+        """First chunk < 12 bytes should not bypass magic number validation."""
+        url = "https://www.gstatic.com/emoji/small_chunk.png"
+        # Split bad magic across small chunks; total > 12 bytes but not a valid image
+        chunks = [b'BAD', b'MAGIC000', b'x' * 100]
         resp = _make_resp_mock(chunks=chunks)
         plugin.session.get.return_value = resp
 

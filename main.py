@@ -157,10 +157,7 @@ class EmojiKitchenPlugin(Star):
                 logger.warning("Emoji Kitchen: cached metadata corrupted (%s), re-downloading...", e)
                 self.metadata = None
                 # 缓存损坏 → 删除并重新下载
-                try:
-                    self._cache_file.unlink()
-                except OSError:
-                    pass
+                self._cache_file.unlink(missing_ok=True)
                 await self._download_metadata()
                 # 再次尝试加载
                 if self._cache_file.exists():
@@ -314,7 +311,8 @@ class EmojiKitchenPlugin(Star):
                 logger.error("Emoji Kitchen: session not initialized")
                 return None
 
-            stripped = url.replace("https://", "").replace("http://", "")
+            parsed = urlparse(url)
+            stripped = parsed.netloc + parsed.path
             mirror_urls = [
                 url,
                 f"https://i0.wp.com/{stripped}",
@@ -346,18 +344,21 @@ class EmojiKitchenPlugin(Star):
 
                         # 流式写入文件
                         total_size = 0
-                        is_first_chunk = True
+                        magic_buf = bytearray()
+                        magic_checked = False
 
                         with open(tmp_path, "wb") as f:
                             async for chunk in resp.content.iter_chunked(65536):
                                 if not chunk:
                                     continue
 
-                                # 校验 Magic Number (仅第一块)
-                                if is_first_chunk:
-                                    if len(chunk) >= 12 and not _is_valid_image_magic(chunk):
-                                        raise ValueError("invalid image magic number")
-                                    is_first_chunk = False
+                                # 校验 Magic Number：累积前缀直到凑齐 12 字节
+                                if not magic_checked:
+                                    magic_buf.extend(chunk)
+                                    if len(magic_buf) >= 12:
+                                        if not _is_valid_image_magic(bytes(magic_buf)):
+                                            raise ValueError("invalid image magic number")
+                                        magic_checked = True
 
                                 total_size += len(chunk)
                                 if total_size > MAX_IMAGE_BYTES:
