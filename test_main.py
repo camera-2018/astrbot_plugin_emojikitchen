@@ -60,6 +60,7 @@ with patch.dict("sys.modules", _MOCKS):
         _is_allowed_image_url,
         _is_mirror_target_allowed,
         _is_valid_image_magic,
+        _codepoint_variants,
         EMOJI_ITER_PATTERN,
         TWO_EMOJI_MSG_PATTERN,
         EmojiKitchenPlugin,
@@ -380,6 +381,136 @@ class TestRegex:
         assert TWO_EMOJI_MSG_PATTERN.match("😀😺")
         assert TWO_EMOJI_MSG_PATTERN.match("😀 😺")
         assert not TWO_EMOJI_MSG_PATTERN.match("😀😺 a")
+
+    def test_two_emoji_with_redundant_fe0f(self):
+        """Fully-qualified emoji (with redundant FE0F) should still match."""
+        # 😀\uFE0F😺 - grinning face with redundant FE0F + cat
+        assert TWO_EMOJI_MSG_PATTERN.match("\U0001F600\uFE0F\U0001F63A")
+
+
+# ============================================================
+# Tests: Utility Functions
+# ============================================================
+
+class TestEmojiToCodepoint:
+    def test_simple_emoji(self):
+        assert emoji_to_codepoint("\U0001F600") == "1f600"
+
+    def test_emoji_with_fe0f(self):
+        assert emoji_to_codepoint("\u2764\uFE0F") == "2764-fe0f"
+
+    def test_zwj_sequence(self):
+        # 👨‍🍳 = U+1F468 U+200D U+1F373
+        assert emoji_to_codepoint("\U0001F468\u200D\U0001F373") == "1f468-200d-1f373"
+
+
+class TestUrlToCacheFilename:
+    def test_produces_hash_filename(self):
+        name = _url_to_cache_filename("https://www.gstatic.com/emoji/test.png")
+        assert name.endswith(".png")
+        assert len(name) > 4  # hash + extension
+
+    def test_unknown_extension_defaults_to_png(self):
+        name = _url_to_cache_filename("https://www.gstatic.com/emoji/test.bmp")
+        assert name.endswith(".png")
+
+    def test_valid_extensions_preserved(self):
+        for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+            name = _url_to_cache_filename(f"https://www.gstatic.com/emoji/test{ext}")
+            assert name.endswith(ext)
+
+
+class TestImageMagic:
+    def test_valid_png(self):
+        data = b'\x89PNG\r\n\x1a\n' + b'\x00' * 20
+        assert _is_valid_image_magic(data) is True
+
+    def test_valid_jpeg(self):
+        data = b'\xff\xd8\xff' + b'\x00' * 20
+        assert _is_valid_image_magic(data) is True
+
+    def test_valid_gif87a(self):
+        data = b'GIF87a' + b'\x00' * 20
+        assert _is_valid_image_magic(data) is True
+
+    def test_valid_gif89a(self):
+        data = b'GIF89a' + b'\x00' * 20
+        assert _is_valid_image_magic(data) is True
+
+    def test_valid_webp(self):
+        data = b'RIFF\x00\x00\x00\x00WEBP' + b'\x00' * 20
+        assert _is_valid_image_magic(data) is True
+
+    def test_invalid_magic(self):
+        data = b'BADMAGIC' + b'\x00' * 20
+        assert _is_valid_image_magic(data) is False
+
+    def test_empty_data(self):
+        assert _is_valid_image_magic(b'') is False
+
+    def test_short_data(self):
+        assert _is_valid_image_magic(b'\x89PN') is False
+
+
+class TestCodepointVariants:
+    def test_no_fe0f(self):
+        assert _codepoint_variants("1f600") == ["1f600"]
+
+    def test_with_fe0f(self):
+        variants = _codepoint_variants("2764-fe0f")
+        assert variants == ["2764-fe0f", "2764"]
+
+    def test_with_fe0f_in_zwj(self):
+        variants = _codepoint_variants("1f468-200d-2764-fe0f-200d-1f468")
+        assert variants[0] == "1f468-200d-2764-fe0f-200d-1f468"
+        assert variants[1] == "1f468-200d-2764-200d-1f468"
+
+
+class TestFindCombinationFE0FFallback:
+    """Test that _find_combination handles redundant FE0F in codepoints."""
+
+    def test_lookup_with_redundant_fe0f(self, plugin):
+        """When emoji has redundant FE0F, fallback should strip it and find the combo."""
+        plugin.metadata = {
+            "data": {
+                "1f600": {
+                    "combinations": {
+                        "1f63a": [
+                            {"gStaticUrl": "https://www.gstatic.com/emoji/test.png", "isLatest": True},
+                        ],
+                    },
+                },
+                "1f63a": {"combinations": {}},
+            },
+        }
+        # Simulate 😀\uFE0F (fully-qualified) + 😺
+        # emoji_to_codepoint would produce "1f600-fe0f" for the first emoji
+        result = plugin._find_combination("\U0001F600\uFE0F", "\U0001F63A")
+        assert result == "https://www.gstatic.com/emoji/test.png"
+
+    def test_lookup_without_fe0f_still_works(self, plugin):
+        """Normal emojis without FE0F should continue to work."""
+        plugin.metadata = MOCK_METADATA
+        result = plugin._find_combination("\U0001F600", "\U0001F63A")
+        assert result == "https://www.gstatic.com/emoji/1f600_1f63a.png"
+
+    def test_lookup_with_required_fe0f(self, plugin):
+        """Emojis that require FE0F (text-presentation) should work with fe0f in metadata key."""
+        plugin.metadata = {
+            "data": {
+                "2764-fe0f": {
+                    "combinations": {
+                        "1f525": [
+                            {"gStaticUrl": "https://www.gstatic.com/emoji/heart_fire.png", "isLatest": True},
+                        ],
+                    },
+                },
+                "1f525": {"combinations": {}},
+            },
+        }
+        # ❤️ + 🔥
+        result = plugin._find_combination("\u2764\uFE0F", "\U0001F525")
+        assert result == "https://www.gstatic.com/emoji/heart_fire.png"
 
 
 # ============================================================

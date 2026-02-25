@@ -70,6 +70,8 @@ _IMAGE_MAGIC_SIGNATURES = [
 
 def _is_valid_image_magic(data: bytes) -> bool:
     """通过文件头校验数据是否为已知图片格式。"""
+    if len(data) < 4:
+        return False
     for magic1, s1, magic2, s2 in _IMAGE_MAGIC_SIGNATURES:
         if data[s1] == magic1:
             if magic2 is None or data[s2] == magic2:
@@ -128,6 +130,20 @@ def emoji_to_codepoint(emoji_char: str) -> str:
     Example: '😀' -> '1f600', '👨‍🍳' -> '1f468-200d-1f373'
     """
     return "-".join(f"{ord(c):x}" for c in emoji_char)
+
+
+def _codepoint_variants(cp: str) -> list[str]:
+    """Generate codepoint variants with/without fe0f for fallback matching.
+
+    Emoji_Presentation characters don't have fe0f in metadata keys, but the
+    regex may capture a redundant fe0f when the input contains fully-qualified
+    emoji sequences. This helper enables fallback lookup.
+    """
+    variants = [cp]
+    cp_no_fe0f = "-".join(part for part in cp.split("-") if part != "fe0f")
+    if cp_no_fe0f != cp:
+        variants.append(cp_no_fe0f)
+    return variants
 
 
 def _url_to_cache_filename(url: str) -> str:
@@ -273,7 +289,11 @@ class EmojiKitchenPlugin(Star):
         logger.error("Emoji Kitchen: all mirror sources failed after retries")
 
     def _find_combination(self, emoji1: str, emoji2: str) -> str | None:
-        """查找两个 emoji 的合成图 URL，双向查找。"""
+        """查找两个 emoji 的合成图 URL，双向查找。
+
+        支持 FE0F 变体回退：当 Emoji_Presentation 字符携带冗余 FE0F 时，
+        会自动尝试去掉 fe0f 后的 codepoint 进行查找。
+        """
         if not self.metadata:
             return None
 
@@ -281,13 +301,14 @@ class EmojiKitchenPlugin(Star):
         cp1 = emoji_to_codepoint(emoji1)
         cp2 = emoji_to_codepoint(emoji2)
 
-        url = self._lookup(data, cp1, cp2)
-        if url:
-            return url
-
-        url = self._lookup(data, cp2, cp1)
-        if url:
-            return url
+        for c1 in _codepoint_variants(cp1):
+            for c2 in _codepoint_variants(cp2):
+                url = self._lookup(data, c1, c2)
+                if url:
+                    return url
+                url = self._lookup(data, c2, c1)
+                if url:
+                    return url
 
         return None
 
