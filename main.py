@@ -3,7 +3,7 @@ import json
 import time
 import asyncio
 import hashlib
-from pathlib import Path
+from urllib.parse import urlparse
 
 import regex
 import aiohttp
@@ -48,6 +48,23 @@ TWO_EMOJI_MSG_PATTERN = regex.compile(
 # 图片 Content-Type 白名单
 IMAGE_CONTENT_TYPES = {"image/png", "image/webp", "image/jpeg", "image/gif"}
 
+# SSRF 防护：仅允许从 *.gstatic.com 下载 emoji 图片
+_ALLOWED_IMAGE_HOST_SUFFIX = ".gstatic.com"
+# 单张图片最大允许字节数（防止内存耗尽）
+MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+def _is_allowed_image_url(url: str) -> bool:
+    """SSRF guard: 仅允许 HTTPS 协议且域名属于 *.gstatic.com。"""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme != "https":
+        return False
+    host = parsed.netloc.lower().split(":")[0]  # 去除端口
+    return host == "www.gstatic.com" or host.endswith(_ALLOWED_IMAGE_HOST_SUFFIX)
+
 
 def emoji_to_codepoint(emoji_char: str) -> str:
     """Convert an emoji character (possibly multi-codepoint) to dash-separated hex codepoints.
@@ -60,9 +77,8 @@ def emoji_to_codepoint(emoji_char: str) -> str:
 def _url_to_cache_filename(url: str) -> str:
     """将 URL 转换为安全的缓存文件名（hash + 原始后缀）。"""
     url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
-    # 保留原始文件扩展名以便调试
-    basename = url.rsplit("/", 1)[-1]
-    _, ext = os.path.splitext(basename)
+    # 通过 urlparse 取 path 部分，避免 query 字符串混入扩展名
+    _, ext = os.path.splitext(urlparse(url).path)
     return f"{url_hash}{ext or '.png'}"
 
 
@@ -232,6 +248,11 @@ class EmojiKitchenPlugin(Star):
         3. wsrv.nl 图片代理
         4. images.weserv.nl 图片代理
         """
+        # SSRF 防护：仅允许向白名单域名发起请求
+        if not _is_allowed_image_url(url):
+            logger.warning("Emoji Kitchen: blocked download from disallowed URL: %s", url)
+            return None
+
         filename = _url_to_cache_filename(url)
         local_path = self._img_dir / filename
 
@@ -241,59 +262,69 @@ class EmojiKitchenPlugin(Star):
 
         # 按文件名分段锁，仅阻塞同一文件的并发下载
         lock = self._download_locks.setdefault(filename, asyncio.Lock())
-        async with lock:
-            # double-check：拿到锁后再次检查
-            if local_path.exists():
-                self._download_locks.pop(filename, None)
-                return str(local_path)
+        try:
+            async with lock:
+                # double-check：拿到锁后再次检查
+                if local_path.exists():
+                    return str(local_path)
 
-            stripped = url.replace("https://", "").replace("http://", "")
-            mirror_urls = [
-                url,
-                f"https://i0.wp.com/{stripped}",
-                f"https://wsrv.nl/?url={stripped}",
-                f"https://images.weserv.nl/?url={stripped}",
-            ]
+                stripped = url.replace("https://", "").replace("http://", "")
+                mirror_urls = [
+                    url,
+                    f"https://i0.wp.com/{stripped}",
+                    f"https://wsrv.nl/?url={stripped}",
+                    f"https://images.weserv.nl/?url={stripped}",
+                ]
 
-            timeout = aiohttp.ClientTimeout(total=15, connect=5)
-            tmp_path = str(local_path) + ".tmp"
+                timeout = aiohttp.ClientTimeout(total=15, connect=5)
+                tmp_path = str(local_path) + ".tmp"
 
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                for mirror_url in mirror_urls:
-                    try:
-                        proxy = self._get_proxy() if mirror_url == url else None
-                        async with session.get(mirror_url, proxy=proxy) as resp:
-                            resp.raise_for_status()
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    for mirror_url in mirror_urls:
+                        try:
+                            proxy = self._get_proxy() if mirror_url == url else None
+                            async with session.get(mirror_url, proxy=proxy) as resp:
+                                resp.raise_for_status()
 
-                            # 校验 Content-Type
-                            content_type = resp.content_type or ""
-                            if content_type and content_type not in IMAGE_CONTENT_TYPES:
-                                raise ValueError(f"unexpected content-type: {content_type}")
+                                # 校验 Content-Type
+                                content_type = resp.content_type or ""
+                                if content_type and content_type not in IMAGE_CONTENT_TYPES:
+                                    raise ValueError(f"unexpected content-type: {content_type}")
 
-                            content = await resp.read()
-                            if len(content) < 100:
-                                raise ValueError(f"response too small ({len(content)} bytes)")
+                                # 分块读取，防止超大响应占满内存
+                                chunks = []
+                                total = 0
+                                async for chunk in resp.content.iter_chunked(65536):
+                                    total += len(chunk)
+                                    if total > MAX_IMAGE_BYTES:
+                                        raise ValueError(f"response too large (>{MAX_IMAGE_BYTES} bytes)")
+                                    chunks.append(chunk)
+                                content = b"".join(chunks)
 
-                            with open(tmp_path, "wb") as f:
-                                f.write(content)
-                            os.replace(tmp_path, str(local_path))
-                            logger.info("Emoji Kitchen: image downloaded from %s", mirror_url.split("?")[0].split("/")[2])
-                            self._download_locks.pop(filename, None)
-                            return str(local_path)
-                    except Exception as e:
-                        logger.warning(
-                            "Emoji Kitchen: image download failed from %s: %s",
-                            mirror_url.split("?")[0].split("/")[2], e,
-                        )
-                        if os.path.exists(tmp_path):
-                            try:
-                                os.remove(tmp_path)
-                            except OSError:
-                                pass
+                                if len(content) < 100:
+                                    raise ValueError(f"response too small ({len(content)} bytes)")
 
-            logger.error("Emoji Kitchen: all image sources failed: %s", filename)
+                                with open(tmp_path, "wb") as f:
+                                    f.write(content)
+                                os.replace(tmp_path, str(local_path))
+                                logger.info("Emoji Kitchen: image downloaded from %s", mirror_url.split("?")[0].split("/")[2])
+                                return str(local_path)
+                        except Exception as e:
+                            logger.warning(
+                                "Emoji Kitchen: image download failed from %s: %s",
+                                mirror_url.split("?")[0].split("/")[2], e,
+                            )
+                            if os.path.exists(tmp_path):
+                                try:
+                                    os.remove(tmp_path)
+                                except OSError:
+                                    pass
+
+                logger.error("Emoji Kitchen: all image sources failed: %s", filename)
+                return None
+        finally:
+            # 无论正常返回、异常还是任务取消，统一清理锁映射
             self._download_locks.pop(filename, None)
-            return None
 
     @filter.command("mix")
     async def mix_command(self, event: AstrMessageEvent):
@@ -305,8 +336,8 @@ class EmojiKitchenPlugin(Star):
         text = event.message_str.strip()
         emoji_chars = [m.group(0) for m in EMOJI_ITER_PATTERN.finditer(text)]
 
-        if len(emoji_chars) < 2:
-            yield event.plain_result("请提供两个 emoji，例如：/mix 😀😺")
+        if len(emoji_chars) != 2:
+            yield event.plain_result("请提供恰好两个 emoji，例如：/mix 😀😺")
             return
 
         emoji1, emoji2 = emoji_chars[0], emoji_chars[1]
@@ -333,6 +364,10 @@ class EmojiKitchenPlugin(Star):
 
         text = event.message_str
         if not text:
+            return
+
+        # 快速前置过滤：两个 emoji 的消息不会超过 100 个字符
+        if len(text) > 100:
             return
 
         m = TWO_EMOJI_MSG_PATTERN.match(text)
