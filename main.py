@@ -218,7 +218,7 @@ class EmojiKitchenPlugin(Star):
     async def _download_metadata(self):
         """从多个镜像源尝试下载 metadata.json（8.5MB），带重试和完整性校验"""
         logger.info("Emoji Kitchen: downloading metadata.json ...")
-        tmp_file = str(self._cache_file) + ".tmp"
+        tmp_file = self._cache_file.with_name(self._cache_file.name + ".tmp")
         # 注意：使用共享 session 时，超时设置需在请求级别覆盖，或依赖 session 默认值。
         # 这里显式传递 request 级别的超时设置。
         timeout = aiohttp.ClientTimeout(total=60, connect=10)
@@ -252,7 +252,7 @@ class EmojiKitchenPlugin(Star):
                     with open(tmp_file, "r", encoding="utf-8") as f:
                         json.load(f)
 
-                    os.replace(tmp_file, str(self._cache_file))
+                    tmp_file.replace(self._cache_file)
                     logger.info("Emoji Kitchen: metadata.json downloaded successfully")
                     return
 
@@ -264,11 +264,10 @@ class EmojiKitchenPlugin(Star):
                         url.split("/")[2], attempt, e,
                     )
                 finally:
-                    if os.path.exists(tmp_file):
-                        try:
-                            os.remove(tmp_file)
-                        except OSError:
-                            pass
+                    try:
+                        tmp_file.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
         logger.error("Emoji Kitchen: all mirror sources failed after retries")
 
@@ -363,7 +362,7 @@ class EmojiKitchenPlugin(Star):
             ]
 
             timeout = aiohttp.ClientTimeout(total=15, connect=5)
-            tmp_path = str(local_path) + ".tmp"
+            tmp_path = local_path.with_name(local_path.name + ".tmp")
 
             for mirror_url in mirror_urls:
                 try:
@@ -410,7 +409,7 @@ class EmojiKitchenPlugin(Star):
                         if total_size < 100:
                             raise ValueError(f"response too small ({total_size} bytes)")
 
-                        os.replace(tmp_path, str(local_path))
+                        tmp_path.replace(local_path)
                         logger.info("Emoji Kitchen: image downloaded from %s", mirror_url.split("?")[0].split("/")[2])
                         return str(local_path)
                 except Exception as e:
@@ -418,11 +417,10 @@ class EmojiKitchenPlugin(Star):
                         "Emoji Kitchen: image download failed from %s: %s",
                         mirror_url.split("?")[0].split("/")[2], e,
                     )
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
             logger.error("Emoji Kitchen: all image sources failed: %s", filename)
             return None
