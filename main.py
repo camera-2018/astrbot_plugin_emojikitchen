@@ -104,7 +104,10 @@ def _url_to_cache_filename(url: str) -> str:
     url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
     # 通过 urlparse 取 path 部分，避免 query 字符串混入扩展名
     _, ext = os.path.splitext(urlparse(url).path)
-    return f"{url_hash}{ext or '.png'}"
+    ext = ext.lower()
+    if ext not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        ext = ".png"
+    return f"{url_hash}{ext}"
 
 
 class EmojiKitchenPlugin(Star):
