@@ -22,7 +22,7 @@ METADATA_URLS = [
     "https://mirror.ghproxy.com/https://raw.githubusercontent.com/xsalazar/emoji-kitchen-backend/main/app/metadata.json",
 ]
 CACHE_MAX_AGE = 7 * 24 * 3600  # 7 days
-MAX_METADATA_BYTES = 20 * 1024 * 1024  # 20 MB
+MAX_METADATA_BYTES = 50 * 1024 * 1024  # 50 MB
 
 # Regex: 匹配单个完整 emoji（含 ZWJ 序列、肤色修饰符、旗帜、keycap 等）
 SINGLE_EMOJI_RE = (
@@ -221,7 +221,7 @@ class EmojiKitchenPlugin(Star):
         tmp_file = str(self._cache_file) + ".tmp"
         # 注意：使用共享 session 时，超时设置需在请求级别覆盖，或依赖 session 默认值。
         # 这里显式传递 request 级别的超时设置。
-        timeout = aiohttp.ClientTimeout(total=60, connect=10)
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
         proxy = self._get_proxy()
 
         if not self.session:
