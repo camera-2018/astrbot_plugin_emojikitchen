@@ -22,7 +22,6 @@ METADATA_URLS = [
     "https://mirror.ghproxy.com/https://raw.githubusercontent.com/xsalazar/emoji-kitchen-backend/main/app/metadata.json",
 ]
 CACHE_MAX_AGE = 7 * 24 * 3600  # 7 days
-MAX_METADATA_BYTES = 50 * 1024 * 1024  # 50 MB
 
 # Regex: 匹配单个完整 emoji（含 ZWJ 序列、肤色修饰符、旗帜、keycap 等）
 SINGLE_EMOJI_RE = (
@@ -221,7 +220,8 @@ class EmojiKitchenPlugin(Star):
         tmp_file = str(self._cache_file) + ".tmp"
         # 注意：使用共享 session 时，超时设置需在请求级别覆盖，或依赖 session 默认值。
         # 这里显式传递 request 级别的超时设置。
-        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        timeout = aiohttp.ClientTimeout(total=60, connect=10)
+        headers = {"Accept-Encoding": "gzip"}
         proxy = self._get_proxy()
 
         if not self.session:
@@ -236,16 +236,10 @@ class EmojiKitchenPlugin(Star):
                         url.split("/")[2], attempt,
                     )
                     # 使用 self.session
-                    async with self.session.get(url, proxy=proxy, timeout=timeout) as resp:
+                    async with self.session.get(url, proxy=proxy, timeout=timeout, headers=headers) as resp:
                         resp.raise_for_status()
-                        total_meta = 0
                         with open(tmp_file, "wb") as f:
                             async for chunk in resp.content.iter_chunked(65536):
-                                total_meta += len(chunk)
-                                if total_meta > MAX_METADATA_BYTES:
-                                    raise ValueError(
-                                        f"metadata too large (>{MAX_METADATA_BYTES} bytes)"
-                                    )
                                 f.write(chunk)
 
                     # 校验 JSON 完整性
