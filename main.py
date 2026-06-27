@@ -22,6 +22,11 @@ METADATA_URLS = [
     "https://mirror.ghproxy.com/https://raw.githubusercontent.com/xsalazar/emoji-kitchen-backend/main/app/metadata.json",
 ]
 CACHE_MAX_AGE = 7 * 24 * 3600  # 7 days
+MAX_METADATA_BYTES = 256 * 1024 * 1024  # 256 MiB
+METADATA_DOWNLOAD_TOTAL_TIMEOUT = 300
+METADATA_DOWNLOAD_CONNECT_TIMEOUT = 30
+METADATA_DOWNLOAD_SOCKET_READ_TIMEOUT = 60
+METADATA_CHUNK_SIZE = 256 * 1024
 
 # Regex: 匹配单个完整 emoji（含 ZWJ 序列、肤色修饰符、旗帜、keycap 等）
 SINGLE_EMOJI_RE = (
@@ -262,12 +267,16 @@ class EmojiKitchenPlugin(Star):
             logger.error("Emoji Kitchen: metadata.json not found")
 
     async def _download_metadata(self):
-        """从多个镜像源尝试下载 metadata.json（8.5MB），带重试和完整性校验"""
+        """从多个镜像源尝试下载较大的 metadata.json，带重试和完整性校验。"""
         logger.info("Emoji Kitchen: downloading metadata.json ...")
         tmp_file = str(self._cache_file) + ".tmp"
         # 注意：使用共享 session 时，超时设置需在请求级别覆盖，或依赖 session 默认值。
         # 这里显式传递 request 级别的超时设置。
-        timeout = aiohttp.ClientTimeout(total=60, connect=10)
+        timeout = aiohttp.ClientTimeout(
+            total=METADATA_DOWNLOAD_TOTAL_TIMEOUT,
+            connect=METADATA_DOWNLOAD_CONNECT_TIMEOUT,
+            sock_read=METADATA_DOWNLOAD_SOCKET_READ_TIMEOUT,
+        )
         headers = {"Accept-Encoding": "gzip"}
         proxy = self._get_proxy()
 
@@ -285,8 +294,16 @@ class EmojiKitchenPlugin(Star):
                     # 使用 self.session
                     async with self.session.get(url, proxy=proxy, timeout=timeout, headers=headers) as resp:
                         resp.raise_for_status()
+                        total_size = 0
                         with open(tmp_file, "wb") as f:
-                            async for chunk in resp.content.iter_chunked(65536):
+                            async for chunk in resp.content.iter_chunked(METADATA_CHUNK_SIZE):
+                                if not chunk:
+                                    continue
+                                total_size += len(chunk)
+                                if total_size > MAX_METADATA_BYTES:
+                                    raise ValueError(
+                                        f"metadata too large (>{MAX_METADATA_BYTES} bytes)"
+                                    )
                                 f.write(chunk)
 
                     # 校验 JSON 完整性

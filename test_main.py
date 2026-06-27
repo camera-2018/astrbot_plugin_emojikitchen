@@ -252,6 +252,47 @@ class TestDownloadImage:
 
 
 # ============================================================
+# Tests: Metadata Download
+# ============================================================
+
+class TestDownloadMetadata:
+    def test_metadata_limit_has_room_for_current_dataset(self):
+        assert _main_module.MAX_METADATA_BYTES >= 100 * 1024 * 1024
+
+    @pytest.mark.asyncio
+    async def test_download_metadata_success_with_large_timeout(self, plugin):
+        metadata = b'{"knownSupportedEmoji": [], "data": {}}'
+        resp = _make_resp_mock(chunks=(metadata[:12], metadata[12:]))
+        plugin.session.get.return_value = resp
+
+        _main_module.aiohttp.ClientTimeout.reset_mock()
+
+        await plugin._download_metadata()
+
+        assert plugin._cache_file.read_bytes() == metadata
+        _main_module.aiohttp.ClientTimeout.assert_called_once_with(
+            total=_main_module.METADATA_DOWNLOAD_TOTAL_TIMEOUT,
+            connect=_main_module.METADATA_DOWNLOAD_CONNECT_TIMEOUT,
+            sock_read=_main_module.METADATA_DOWNLOAD_SOCKET_READ_TIMEOUT,
+        )
+
+    @pytest.mark.asyncio
+    async def test_download_metadata_rejects_oversized_response(self, plugin):
+        metadata = b'{"knownSupportedEmoji": [], "data": {}}'
+        resp = _make_resp_mock(chunks=(metadata[:12], metadata[12:]))
+        plugin.session.get.return_value = resp
+
+        with (
+            patch.object(_main_module, "METADATA_URLS", ["https://example.com/metadata.json"]),
+            patch.object(_main_module, "MAX_METADATA_BYTES", 8),
+        ):
+            await plugin._download_metadata()
+
+        assert not plugin._cache_file.exists()
+        assert not Path(str(plugin._cache_file) + ".tmp").exists()
+
+
+# ============================================================
 # Tests: Session Lifecycle
 # ============================================================
 
