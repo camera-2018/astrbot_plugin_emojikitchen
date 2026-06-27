@@ -4,6 +4,8 @@ import time
 import asyncio
 import hashlib
 import weakref
+import gzip
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 import regex
@@ -15,18 +17,31 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
 
+INDEX_URLS = [
+    "https://raw.githubusercontent.com/camera-2018/astrbot_plugin_emojikitchen/main/assets/emoji_index.json.gz",
+    "https://gh.dn11.top/https://raw.githubusercontent.com/camera-2018/astrbot_plugin_emojikitchen/main/assets/emoji_index.json.gz",
+    "https://gh-proxy.com/https://raw.githubusercontent.com/camera-2018/astrbot_plugin_emojikitchen/main/assets/emoji_index.json.gz",
+]
 METADATA_URLS = [
     "https://raw.githubusercontent.com/xsalazar/emoji-kitchen-backend/main/app/metadata.json",
-    "https://ghfast.top/https://raw.githubusercontent.com/xsalazar/emoji-kitchen-backend/main/app/metadata.json",
+    "https://gh.dn11.top/https://raw.githubusercontent.com/xsalazar/emoji-kitchen-backend/main/app/metadata.json",
     "https://gh-proxy.com/https://raw.githubusercontent.com/xsalazar/emoji-kitchen-backend/main/app/metadata.json",
-    "https://mirror.ghproxy.com/https://raw.githubusercontent.com/xsalazar/emoji-kitchen-backend/main/app/metadata.json",
 ]
 CACHE_MAX_AGE = 7 * 24 * 3600  # 7 days
+DOWNLOAD_RETRY_ATTEMPTS = 3
+IMAGE_DOWNLOAD_ATTEMPTS = 2
+RETRY_BACKOFF_SECONDS = (0.5, 2.0)
+MAX_INDEX_BYTES = 16 * 1024 * 1024  # 16 MiB
+INDEX_DOWNLOAD_TOTAL_TIMEOUT = 60
+INDEX_DOWNLOAD_CONNECT_TIMEOUT = 10
+INDEX_DOWNLOAD_SOCKET_READ_TIMEOUT = 20
+INDEX_CHUNK_SIZE = 64 * 1024
 MAX_METADATA_BYTES = 256 * 1024 * 1024  # 256 MiB
 METADATA_DOWNLOAD_TOTAL_TIMEOUT = 300
 METADATA_DOWNLOAD_CONNECT_TIMEOUT = 30
 METADATA_DOWNLOAD_SOCKET_READ_TIMEOUT = 60
 METADATA_CHUNK_SIZE = 256 * 1024
+EMBEDDED_INDEX_FILE = Path(__file__).resolve().parent / "assets" / "emoji_index.json.gz"
 
 # Regex: 匹配单个完整 emoji（含 ZWJ 序列、肤色修饰符、旗帜、keycap 等）
 SINGLE_EMOJI_RE = (
@@ -148,6 +163,24 @@ def _url_to_cache_filename(url: str) -> str:
     return f"{url_hash}{ext}"
 
 
+def _source_label(url: str) -> str:
+    return urlparse(url).netloc or url
+
+
+def _remove_file_if_exists(path: str | Path) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _retry_delay(attempt: int) -> float:
+    index = max(0, attempt - 1)
+    if index < len(RETRY_BACKOFF_SECONDS):
+        return RETRY_BACKOFF_SECONDS[index]
+    return RETRY_BACKOFF_SECONDS[-1] if RETRY_BACKOFF_SECONDS else 0
+
+
 def _strip_mix_command_prefix(text: str) -> str:
     """兼容不同 AstrBot 版本/平台保留或剥离命令名前缀的情况。"""
     return MIX_COMMAND_PREFIX_PATTERN.sub("", text.strip(), count=1).strip()
@@ -203,7 +236,10 @@ class EmojiKitchenPlugin(Star):
         # 使用框架提供的数据目录
         self._data_dir = StarTools.get_data_dir("emoji_kitchen")
         self._cache_file = self._data_dir / "metadata.json"
+        self._index_cache_file = self._data_dir / "emoji_index.json.gz"
         self._img_dir = self._data_dir / "images"
+        self._embedded_index_file = EMBEDDED_INDEX_FILE
+        self._metadata_refresh_task: asyncio.Task | None = None
 
     def _get_proxy(self) -> str | None:
         """从环境变量获取 HTTP 代理。"""
@@ -229,106 +265,250 @@ class EmojiKitchenPlugin(Star):
 
     async def _load_metadata_unlocked(self):
         """加载 metadata 的实际逻辑（需在 _metadata_lock 保护下调用）。"""
-        need_download = True
+        for path, source in (
+            (self._index_cache_file, "index cache"),
+            (self._cache_file, "metadata cache"),
+        ):
+            if not path.exists():
+                continue
 
-        if self._cache_file.exists():
-            file_age = time.time() - self._cache_file.stat().st_mtime
-            if file_age < CACHE_MAX_AGE:
-                need_download = False
-
-        if need_download:
-            await self._download_metadata()
-
-        if self._cache_file.exists():
+            file_age = time.time() - path.stat().st_mtime
             try:
-                self.metadata = json.loads(self._cache_file.read_text(encoding="utf-8"))
-                logger.info(
-                    "Emoji Kitchen: metadata loaded, %d supported emoji",
-                    len(self.metadata.get("knownSupportedEmoji", [])),
-                )
+                self._load_metadata_from_file(path, source)
+                if file_age >= CACHE_MAX_AGE:
+                    self._schedule_metadata_refresh()
+                return
             except (json.JSONDecodeError, ValueError) as e:
-                logger.warning("Emoji Kitchen: cached metadata corrupted (%s), re-downloading...", e)
+                logger.warning(
+                    "Emoji Kitchen: %s corrupted (%s), falling back...",
+                    source,
+                    e,
+                )
                 self.metadata = None
-                # 缓存损坏 → 删除并重新下载
-                self._cache_file.unlink(missing_ok=True)
-                await self._download_metadata()
-                # 再次尝试加载
-                if self._cache_file.exists():
-                    try:
-                        self.metadata = json.loads(self._cache_file.read_text(encoding="utf-8"))
-                        logger.info("Emoji Kitchen: metadata re-loaded after re-download")
-                    except Exception:
-                        logger.exception("Emoji Kitchen: metadata still corrupted after re-download")
-                        self.metadata = None
+                _remove_file_if_exists(path)
             except Exception as e:
-                logger.exception("Emoji Kitchen: failed to load metadata: %s", e)
+                logger.exception("Emoji Kitchen: failed to load %s: %s", source, e)
                 self.metadata = None
-        else:
-            logger.error("Emoji Kitchen: metadata.json not found")
 
-    async def _download_metadata(self):
-        """从多个镜像源尝试下载较大的 metadata.json，带重试和完整性校验。"""
+        if self._load_embedded_metadata():
+            self._schedule_metadata_refresh()
+            return
+
+        await self._download_metadata()
+        for path, source in (
+            (self._index_cache_file, "index cache"),
+            (self._cache_file, "metadata cache"),
+        ):
+            if not path.exists():
+                continue
+            try:
+                self._load_metadata_from_file(path, source)
+                return
+            except Exception as e:
+                logger.exception(
+                    "Emoji Kitchen: %s still unavailable after download: %s",
+                    source,
+                    e,
+                )
+                self.metadata = None
+
+        logger.error("Emoji Kitchen: metadata.json not found and embedded index unavailable")
+
+    def _schedule_metadata_refresh(self) -> None:
+        """后台刷新 metadata，不阻塞插件初始化。"""
+        if not self.session:
+            return
+        if self._metadata_refresh_task and not self._metadata_refresh_task.done():
+            return
+        self._metadata_refresh_task = asyncio.create_task(self._refresh_metadata_background())
+
+    async def _refresh_metadata_background(self) -> None:
+        try:
+            await self._download_metadata()
+            async with self._metadata_lock:
+                if self._index_cache_file.exists():
+                    self._load_metadata_from_file(self._index_cache_file, "index cache")
+                elif self._cache_file.exists():
+                    self._load_metadata_from_file(self._cache_file, "metadata cache")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Emoji Kitchen: background metadata refresh failed: %s", e)
+
+    def _read_metadata_file(self, path: Path) -> dict:
+        """读取普通 JSON 或 gzip 压缩 JSON metadata/index 文件。"""
+        if path.suffix == ".gz":
+            with gzip.open(path, "rt", encoding="utf-8") as f:
+                return json.load(f)
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _load_metadata_from_file(self, path: Path, source: str) -> None:
+        self.metadata = self._read_metadata_file(path)
+        logger.info(
+            "Emoji Kitchen: metadata loaded from %s, %d supported emoji",
+            source,
+            len(self.metadata.get("knownSupportedEmoji", [])),
+        )
+
+    def _load_embedded_metadata(self) -> bool:
+        """加载随插件发布的精简索引，用于离线或弱网首次启动。"""
+        if not self._embedded_index_file.exists():
+            logger.warning(
+                "Emoji Kitchen: embedded index not found: %s",
+                self._embedded_index_file,
+            )
+            return False
+        try:
+            self._load_metadata_from_file(self._embedded_index_file, "embedded index")
+            return True
+        except Exception as e:
+            logger.exception("Emoji Kitchen: failed to load embedded index: %s", e)
+            self.metadata = None
+            return False
+
+    async def _sleep_before_retry(self, attempt: int, max_attempts: int, label: str) -> None:
+        if attempt >= max_attempts:
+            return
+        delay = _retry_delay(attempt)
+        if delay <= 0:
+            return
+        logger.info("Emoji Kitchen: retrying %s after %.1fs", label, delay)
+        await asyncio.sleep(delay)
+
+    async def _download_to_cache(
+        self,
+        urls: list[str],
+        target_path: Path,
+        label: str,
+        timeout: aiohttp.ClientTimeout,
+        max_bytes: int,
+        chunk_size: int,
+        validate_file,
+        headers: dict | None = None,
+    ) -> bool:
+        if not self.session:
+            logger.error("Emoji Kitchen: session not initialized")
+            return False
+
+        if not urls:
+            logger.warning("Emoji Kitchen: no download sources configured for %s", label)
+            return False
+
+        tmp_file = str(target_path) + ".tmp"
+        proxy = self._get_proxy()
+
+        for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
+            for url in urls:
+                try:
+                    logger.info(
+                        "Emoji Kitchen: trying %s from %s (attempt %d/%d)",
+                        label,
+                        _source_label(url),
+                        attempt,
+                        DOWNLOAD_RETRY_ATTEMPTS,
+                    )
+                    async with self.session.get(url, proxy=proxy, timeout=timeout, headers=headers) as resp:
+                        resp.raise_for_status()
+                        total_size = 0
+                        with open(tmp_file, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(chunk_size):
+                                if not chunk:
+                                    continue
+                                total_size += len(chunk)
+                                if total_size > max_bytes:
+                                    raise ValueError(
+                                        f"{label} too large (>{max_bytes} bytes)"
+                                    )
+                                f.write(chunk)
+
+                    validate_file(Path(tmp_file))
+
+                    os.replace(tmp_file, str(target_path))
+                    logger.info(
+                        "Emoji Kitchen: %s downloaded successfully from %s",
+                        label,
+                        _source_label(url),
+                    )
+                    return True
+
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Emoji Kitchen: downloaded %s from %s is not valid JSON",
+                        label,
+                        _source_label(url),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Emoji Kitchen: failed %s from %s (attempt %d/%d): %s",
+                        label,
+                        _source_label(url),
+                        attempt,
+                        DOWNLOAD_RETRY_ATTEMPTS,
+                        e,
+                    )
+                finally:
+                    _remove_file_if_exists(tmp_file)
+
+            await self._sleep_before_retry(attempt, DOWNLOAD_RETRY_ATTEMPTS, label)
+
+        logger.error("Emoji Kitchen: all %s sources failed after retries", label)
+        return False
+
+    def _validate_json_file(self, path: Path) -> None:
+        with open(path, "r", encoding="utf-8") as f:
+            json.load(f)
+
+    def _validate_gzip_json_file(self, path: Path) -> None:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            json.load(f)
+
+    async def _download_metadata(self) -> bool:
+        """优先下载精简索引，失败时再回退到完整 metadata.json。"""
+        if await self._download_index_cache():
+            return True
+        return await self._download_full_metadata()
+
+    async def _download_index_cache(self) -> bool:
+        if not INDEX_URLS:
+            return False
+        logger.info("Emoji Kitchen: downloading compact emoji index ...")
+        timeout = aiohttp.ClientTimeout(
+            total=INDEX_DOWNLOAD_TOTAL_TIMEOUT,
+            connect=INDEX_DOWNLOAD_CONNECT_TIMEOUT,
+            sock_read=INDEX_DOWNLOAD_SOCKET_READ_TIMEOUT,
+        )
+        headers = {"Accept-Encoding": "gzip"}
+        return await self._download_to_cache(
+            INDEX_URLS,
+            self._index_cache_file,
+            "emoji index",
+            timeout,
+            MAX_INDEX_BYTES,
+            INDEX_CHUNK_SIZE,
+            self._validate_gzip_json_file,
+            headers=headers,
+        )
+
+    async def _download_full_metadata(self) -> bool:
+        if not METADATA_URLS:
+            return False
         logger.info("Emoji Kitchen: downloading metadata.json ...")
-        tmp_file = str(self._cache_file) + ".tmp"
-        # 注意：使用共享 session 时，超时设置需在请求级别覆盖，或依赖 session 默认值。
-        # 这里显式传递 request 级别的超时设置。
         timeout = aiohttp.ClientTimeout(
             total=METADATA_DOWNLOAD_TOTAL_TIMEOUT,
             connect=METADATA_DOWNLOAD_CONNECT_TIMEOUT,
             sock_read=METADATA_DOWNLOAD_SOCKET_READ_TIMEOUT,
         )
         headers = {"Accept-Encoding": "gzip"}
-        proxy = self._get_proxy()
-
-        if not self.session:
-            logger.error("Emoji Kitchen: session not initialized")
-            return
-
-        for url in METADATA_URLS:
-            for attempt in range(1, 4):
-                try:
-                    logger.info(
-                        "Emoji Kitchen: trying %s (attempt %d/3)",
-                        url.split("/")[2], attempt,
-                    )
-                    # 使用 self.session
-                    async with self.session.get(url, proxy=proxy, timeout=timeout, headers=headers) as resp:
-                        resp.raise_for_status()
-                        total_size = 0
-                        with open(tmp_file, "wb") as f:
-                            async for chunk in resp.content.iter_chunked(METADATA_CHUNK_SIZE):
-                                if not chunk:
-                                    continue
-                                total_size += len(chunk)
-                                if total_size > MAX_METADATA_BYTES:
-                                    raise ValueError(
-                                        f"metadata too large (>{MAX_METADATA_BYTES} bytes)"
-                                    )
-                                f.write(chunk)
-
-                    # 校验 JSON 完整性
-                    with open(tmp_file, "r", encoding="utf-8") as f:
-                        json.load(f)
-
-                    os.replace(tmp_file, str(self._cache_file))
-                    logger.info("Emoji Kitchen: metadata.json downloaded successfully")
-                    return
-
-                except json.JSONDecodeError:
-                    logger.warning("Emoji Kitchen: downloaded file is not valid JSON, retrying...")
-                except Exception as e:
-                    logger.warning(
-                        "Emoji Kitchen: failed from %s (attempt %d): %s",
-                        url.split("/")[2], attempt, e,
-                    )
-                finally:
-                    if os.path.exists(tmp_file):
-                        try:
-                            os.remove(tmp_file)
-                        except OSError:
-                            pass
-
-        logger.error("Emoji Kitchen: all mirror sources failed after retries")
+        return await self._download_to_cache(
+            METADATA_URLS,
+            self._cache_file,
+            "metadata.json",
+            timeout,
+            MAX_METADATA_BYTES,
+            METADATA_CHUNK_SIZE,
+            self._validate_json_file,
+            headers=headers,
+        )
 
     def _find_combination(self, emoji1: str, emoji2: str) -> str | None:
         """查找两个 emoji 的合成图 URL，双向查找。"""
@@ -359,6 +539,13 @@ class EmojiKitchenPlugin(Star):
         combo_list = combinations.get(right_cp)
         if not combo_list:
             return None
+
+        # 精简索引中 combinations[right_cp] 直接存 URL 字符串。
+        if isinstance(combo_list, str):
+            return combo_list
+
+        if isinstance(combo_list, dict):
+            return combo_list.get("gStaticUrl") or combo_list.get("url")
 
         # 找到 isLatest=true 且有有效 URL 的版本
         for combo in combo_list:
@@ -423,64 +610,73 @@ class EmojiKitchenPlugin(Star):
             timeout = aiohttp.ClientTimeout(total=15, connect=5)
             tmp_path = str(local_path) + ".tmp"
 
-            for mirror_url in mirror_urls:
-                try:
-                    proxy = self._get_proxy() if mirror_url == url else None
-                    async with self.session.get(mirror_url, proxy=proxy, timeout=timeout) as resp:
-                        resp.raise_for_status()
+            for attempt in range(1, IMAGE_DOWNLOAD_ATTEMPTS + 1):
+                for mirror_url in mirror_urls:
+                    try:
+                        proxy = self._get_proxy() if mirror_url == url else None
+                        async with self.session.get(mirror_url, proxy=proxy, timeout=timeout) as resp:
+                            resp.raise_for_status()
 
-                        # SSRF 防护：校验重定向后的最终 URL
-                        # 对所有分支都必须校验，防止代理服务被滥用重定向到内网
-                        final_url = str(resp.url)
-                        if not _is_allowed_image_url(final_url):
-                            raise ValueError(
-                                f"redirect to disallowed host: {final_url}"
+                            # SSRF 防护：校验重定向后的最终 URL
+                            # 对所有分支都必须校验，防止代理服务被滥用重定向到内网
+                            final_url = str(resp.url)
+                            if not _is_allowed_image_url(final_url):
+                                raise ValueError(
+                                    f"redirect to disallowed host: {final_url}"
+                                )
+
+                            # 校验 Content-Type（空值视为不合法，不放行）
+                            content_type = resp.content_type or ""
+                            if not content_type or content_type not in IMAGE_CONTENT_TYPES:
+                                raise ValueError(f"unexpected content-type: {content_type!r}")
+
+                            # 流式写入文件
+                            total_size = 0
+                            magic_buf = bytearray()
+                            magic_checked = False
+
+                            with open(tmp_path, "wb") as f:
+                                async for chunk in resp.content.iter_chunked(65536):
+                                    if not chunk:
+                                        continue
+
+                                    # 校验 Magic Number：累积前缀直到凑齐 12 字节
+                                    if not magic_checked:
+                                        magic_buf.extend(chunk)
+                                        if len(magic_buf) >= 12:
+                                            if not _is_valid_image_magic(bytes(magic_buf)):
+                                                raise ValueError("invalid image magic number")
+                                            magic_checked = True
+
+                                    total_size += len(chunk)
+                                    if total_size > MAX_IMAGE_BYTES:
+                                        raise ValueError(f"response too large (>{MAX_IMAGE_BYTES} bytes)")
+                                    f.write(chunk)
+
+                            if total_size < 100:
+                                raise ValueError(f"response too small ({total_size} bytes)")
+
+                            os.replace(tmp_path, str(local_path))
+                            logger.info(
+                                "Emoji Kitchen: image downloaded from %s",
+                                _source_label(mirror_url),
                             )
+                            return str(local_path)
+                    except Exception as e:
+                        logger.warning(
+                            "Emoji Kitchen: image download failed from %s (attempt %d/%d): %s",
+                            _source_label(mirror_url),
+                            attempt,
+                            IMAGE_DOWNLOAD_ATTEMPTS,
+                            e,
+                        )
+                        _remove_file_if_exists(tmp_path)
 
-                        # 校验 Content-Type（空值视为不合法，不放行）
-                        content_type = resp.content_type or ""
-                        if not content_type or content_type not in IMAGE_CONTENT_TYPES:
-                            raise ValueError(f"unexpected content-type: {content_type!r}")
-
-                        # 流式写入文件
-                        total_size = 0
-                        magic_buf = bytearray()
-                        magic_checked = False
-
-                        with open(tmp_path, "wb") as f:
-                            async for chunk in resp.content.iter_chunked(65536):
-                                if not chunk:
-                                    continue
-
-                                # 校验 Magic Number：累积前缀直到凑齐 12 字节
-                                if not magic_checked:
-                                    magic_buf.extend(chunk)
-                                    if len(magic_buf) >= 12:
-                                        if not _is_valid_image_magic(bytes(magic_buf)):
-                                            raise ValueError("invalid image magic number")
-                                        magic_checked = True
-
-                                total_size += len(chunk)
-                                if total_size > MAX_IMAGE_BYTES:
-                                    raise ValueError(f"response too large (>{MAX_IMAGE_BYTES} bytes)")
-                                f.write(chunk)
-
-                        if total_size < 100:
-                            raise ValueError(f"response too small ({total_size} bytes)")
-
-                        os.replace(tmp_path, str(local_path))
-                        logger.info("Emoji Kitchen: image downloaded from %s", mirror_url.split("?")[0].split("/")[2])
-                        return str(local_path)
-                except Exception as e:
-                    logger.warning(
-                        "Emoji Kitchen: image download failed from %s: %s",
-                        mirror_url.split("?")[0].split("/")[2], e,
-                    )
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
+                await self._sleep_before_retry(
+                    attempt,
+                    IMAGE_DOWNLOAD_ATTEMPTS,
+                    "image download",
+                )
 
             logger.error("Emoji Kitchen: all image sources failed: %s", filename)
             return None
@@ -557,5 +753,11 @@ class EmojiKitchenPlugin(Star):
 
     async def terminate(self):
         """插件卸载时的清理"""
+        if self._metadata_refresh_task and not self._metadata_refresh_task.done():
+            self._metadata_refresh_task.cancel()
+            try:
+                await self._metadata_refresh_task
+            except asyncio.CancelledError:
+                pass
         if self.session:
             await self.session.close()

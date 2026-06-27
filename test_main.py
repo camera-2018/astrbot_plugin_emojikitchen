@@ -7,6 +7,8 @@ Emoji Kitchen Plugin - Unit Tests
 import asyncio
 import tempfile
 import gc
+import gzip
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -96,7 +98,9 @@ def plugin(tmp_path):
     p = EmojiKitchenPlugin(context)
     p._data_dir = tmp_path
     p._cache_file = tmp_path / "metadata.json"
+    p._index_cache_file = tmp_path / "emoji_index.json.gz"
     p._img_dir = img_dir
+    p._embedded_index_file = tmp_path / "assets" / "emoji_index.json.gz"
     p.metadata = None
 
     # Mock session
@@ -105,6 +109,12 @@ def plugin(tmp_path):
     p.session.close = AsyncMock()
 
     return p
+
+
+@pytest.fixture(autouse=True)
+def _fast_retry_delays(monkeypatch):
+    monkeypatch.setattr(_main_module, "RETRY_BACKOFF_SECONDS", (0, 0, 0))
+
 
 @pytest.fixture
 def plugin_with_meta(plugin):
@@ -135,6 +145,12 @@ def _make_resp_mock(
     resp.__aenter__ = AsyncMock(return_value=resp)
     resp.__aexit__ = AsyncMock(return_value=None)
     return resp
+
+
+def _write_gzip_json(path: Path, payload: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    path.write_bytes(gzip.compress(raw, mtime=0))
 
 
 # ============================================================
@@ -211,6 +227,24 @@ class TestDownloadImage:
         assert path is not None
 
     @pytest.mark.asyncio
+    async def test_download_image_tries_mirror_before_retrying_direct(self, plugin):
+        url = "https://www.gstatic.com/emoji/fallback.png"
+        bad_resp = _make_resp_mock(raise_on_raise_for_status=True)
+        good_resp = _make_resp_mock(
+            final_url="https://i0.wp.com/www.gstatic.com/emoji/fallback.png"
+        )
+        plugin.session.get.side_effect = [bad_resp, good_resp]
+
+        path = await plugin._download_image(url)
+
+        assert path is not None
+        called_urls = [call.args[0] for call in plugin.session.get.call_args_list]
+        assert called_urls[:2] == [
+            "https://www.gstatic.com/emoji/fallback.png",
+            "https://i0.wp.com/www.gstatic.com/emoji/fallback.png",
+        ]
+
+    @pytest.mark.asyncio
     async def test_session_not_initialized(self, plugin):
         plugin.session = None
         path = await plugin._download_image("https://www.gstatic.com/a.png")
@@ -267,7 +301,8 @@ class TestDownloadMetadata:
 
         _main_module.aiohttp.ClientTimeout.reset_mock()
 
-        await plugin._download_metadata()
+        with patch.object(_main_module, "INDEX_URLS", []):
+            await plugin._download_metadata()
 
         assert plugin._cache_file.read_bytes() == metadata
         _main_module.aiohttp.ClientTimeout.assert_called_once_with(
@@ -277,12 +312,62 @@ class TestDownloadMetadata:
         )
 
     @pytest.mark.asyncio
+    async def test_download_metadata_prefers_compact_index(self, plugin):
+        index_payload = {"knownSupportedEmoji": [], "data": {}}
+        index_bytes = gzip.compress(json.dumps(index_payload).encode("utf-8"), mtime=0)
+        resp = _make_resp_mock(chunks=(index_bytes[:12], index_bytes[12:]))
+        plugin.session.get.return_value = resp
+
+        _main_module.aiohttp.ClientTimeout.reset_mock()
+
+        with patch.object(_main_module, "INDEX_URLS", ["https://example.com/index.json.gz"]):
+            await plugin._download_metadata()
+
+        assert plugin._index_cache_file.exists()
+        assert not plugin._cache_file.exists()
+        with gzip.open(plugin._index_cache_file, "rt", encoding="utf-8") as f:
+            assert json.load(f) == index_payload
+        _main_module.aiohttp.ClientTimeout.assert_called_once_with(
+            total=_main_module.INDEX_DOWNLOAD_TOTAL_TIMEOUT,
+            connect=_main_module.INDEX_DOWNLOAD_CONNECT_TIMEOUT,
+            sock_read=_main_module.INDEX_DOWNLOAD_SOCKET_READ_TIMEOUT,
+        )
+
+    @pytest.mark.asyncio
+    async def test_download_metadata_round_robins_sources_before_retry(self, plugin):
+        metadata = b'{"knownSupportedEmoji": [], "data": {}}'
+        bad_resp = _make_resp_mock(raise_on_raise_for_status=True)
+        good_resp = _make_resp_mock(chunks=(metadata[:12], metadata[12:]))
+        plugin.session.get.side_effect = [bad_resp, good_resp]
+
+        with (
+            patch.object(_main_module, "INDEX_URLS", []),
+            patch.object(
+                _main_module,
+                "METADATA_URLS",
+                [
+                    "https://bad.example.com/metadata.json",
+                    "https://good.example.com/metadata.json",
+                ],
+            ),
+        ):
+            await plugin._download_metadata()
+
+        assert plugin._cache_file.read_bytes() == metadata
+        called_urls = [call.args[0] for call in plugin.session.get.call_args_list]
+        assert called_urls == [
+            "https://bad.example.com/metadata.json",
+            "https://good.example.com/metadata.json",
+        ]
+
+    @pytest.mark.asyncio
     async def test_download_metadata_rejects_oversized_response(self, plugin):
         metadata = b'{"knownSupportedEmoji": [], "data": {}}'
         resp = _make_resp_mock(chunks=(metadata[:12], metadata[12:]))
         plugin.session.get.return_value = resp
 
         with (
+            patch.object(_main_module, "INDEX_URLS", []),
             patch.object(_main_module, "METADATA_URLS", ["https://example.com/metadata.json"]),
             patch.object(_main_module, "MAX_METADATA_BYTES", 8),
         ):
@@ -290,6 +375,43 @@ class TestDownloadMetadata:
 
         assert not plugin._cache_file.exists()
         assert not Path(str(plugin._cache_file) + ".tmp").exists()
+
+    @pytest.mark.asyncio
+    async def test_load_metadata_falls_back_to_embedded_index(self, plugin):
+        embedded_index = {
+            "format": "emoji-kitchen-index-v1",
+            "knownSupportedEmoji": ["1f600", "1f63a"],
+            "data": {
+                "1f600": {
+                    "combinations": {
+                        "1f63a": "https://www.gstatic.com/emoji/compact.png",
+                    },
+                },
+            },
+        }
+        _write_gzip_json(plugin._embedded_index_file, embedded_index)
+        plugin._download_metadata = AsyncMock()
+        plugin._schedule_metadata_refresh = MagicMock()
+
+        await plugin._load_metadata()
+
+        plugin._download_metadata.assert_not_called()
+        plugin._schedule_metadata_refresh.assert_called_once()
+        assert plugin.metadata == embedded_index
+        assert plugin._find_combination("😀", "😺") == "https://www.gstatic.com/emoji/compact.png"
+
+    def test_lookup_supports_compact_index_url(self, plugin):
+        plugin.metadata = {
+            "data": {
+                "1f600": {
+                    "combinations": {
+                        "1f63a": "https://www.gstatic.com/emoji/compact.png",
+                    },
+                },
+            },
+        }
+
+        assert plugin._find_combination("😀", "😺") == "https://www.gstatic.com/emoji/compact.png"
 
 
 # ============================================================
