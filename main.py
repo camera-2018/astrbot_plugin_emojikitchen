@@ -45,6 +45,9 @@ EMOJI_ITER_PATTERN = regex.compile(SINGLE_EMOJI_RE)
 TWO_EMOJI_MSG_PATTERN = regex.compile(
     rf"^\s*({SINGLE_EMOJI_RE})\s*({SINGLE_EMOJI_RE})\s*$"
 )
+MIX_COMMAND_PREFIX_PATTERN = regex.compile(
+    r"^\s*/?mix(?:@\S+)?(?:\s+|$)", regex.IGNORECASE
+)
 
 # 图片 Content-Type 白名单
 IMAGE_CONTENT_TYPES = {"image/png", "image/webp", "image/jpeg", "image/gif"}
@@ -138,6 +141,50 @@ def _url_to_cache_filename(url: str) -> str:
     if ext not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
         ext = ".png"
     return f"{url_hash}{ext}"
+
+
+def _strip_mix_command_prefix(text: str) -> str:
+    """兼容不同 AstrBot 版本/平台保留或剥离命令名前缀的情况。"""
+    return MIX_COMMAND_PREFIX_PATTERN.sub("", text.strip(), count=1).strip()
+
+
+def _extract_emoji_pair(text: str) -> tuple[str, str] | None:
+    """从仅包含两个 emoji 的文本中提取 emoji 对。"""
+    m = TWO_EMOJI_MSG_PATTERN.match(text)
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def _resolve_mix_emoji_pair(message_text: str, *parsed_parts: str) -> tuple[str, str] | None:
+    """从命令参数或消息文本中解析 /mix 的两个 emoji。"""
+    candidates: list[str] = []
+    parsed_text = " ".join(
+        str(part).strip() for part in parsed_parts if str(part).strip()
+    )
+    if parsed_text:
+        candidates.append(parsed_text)
+
+    raw_text = (message_text or "").strip()
+    stripped_text = _strip_mix_command_prefix(raw_text)
+    candidates.extend([stripped_text, raw_text])
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        pair = _extract_emoji_pair(candidate)
+        if pair:
+            return pair
+    return None
+
+
+def _stop_event_if_possible(event: AstrMessageEvent) -> None:
+    """在可用时停止事件继续传播，避免命令结果后又触发其它处理。"""
+    stop_event = getattr(event, "stop_event", None)
+    if callable(stop_event):
+        stop_event()
 
 
 class EmojiKitchenPlugin(Star):
@@ -422,25 +469,28 @@ class EmojiKitchenPlugin(Star):
             return None
 
     @filter.command("mix")
-    async def mix_command(self, event: AstrMessageEvent):
+    async def mix_command(
+        self, event: AstrMessageEvent, emoji1: str = "", emoji2: str = ""
+    ):
         """合成两个 emoji：/mix 😀😺"""
         if not self.metadata:
+            _stop_event_if_possible(event)
             yield event.plain_result("⚠️ Emoji Kitchen 数据尚未加载，请稍后再试。")
             return
 
-        text = event.message_str.strip()
-
         # 严格校验：消息（去除首尾空白后）必须「仅包含」恰好两个 emoji，
         # 不允许夹杂其他文字，与用户提示语义保持一致。
-        m = TWO_EMOJI_MSG_PATTERN.match(text)
-        if not m:
+        pair = _resolve_mix_emoji_pair(event.message_str, emoji1, emoji2)
+        if not pair:
+            _stop_event_if_possible(event)
             yield event.plain_result("请提供恰好两个 emoji，例如：/mix 😀😺")
             return
 
-        emoji1, emoji2 = m.group(1), m.group(2)
+        emoji1, emoji2 = pair
         url = self._find_combination(emoji1, emoji2)
 
         if not url:
+            _stop_event_if_possible(event)
             yield event.plain_result(
                 f"😅 抱歉，{emoji1} + {emoji2} 这个组合暂不支持。\n试试其他 emoji 吧！"
             )
@@ -449,8 +499,10 @@ class EmojiKitchenPlugin(Star):
         local_path = await self._download_image(url)
         if local_path:
             chain = [Comp.Image.fromFileSystem(local_path)]
+            _stop_event_if_possible(event)
             yield event.chain_result(chain)
         else:
+            _stop_event_if_possible(event)
             yield event.plain_result("⚠️ 图片下载失败，请稍后再试。")
 
     @filter.event_message_type(EventMessageType.ALL)

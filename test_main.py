@@ -60,6 +60,7 @@ with patch.dict("sys.modules", _MOCKS):
         _is_allowed_image_url,
         _is_mirror_target_allowed,
         _is_valid_image_magic,
+        _resolve_mix_emoji_pair,
         EMOJI_ITER_PATTERN,
         TWO_EMOJI_MSG_PATTERN,
         EmojiKitchenPlugin,
@@ -371,6 +372,59 @@ class TestAutoMixSelfIgnore:
 
         assert len(results) == 1
         plugin_with_meta._download_image.assert_called()
+
+
+# ============================================================
+# Tests: Mix Command Parsing
+# ============================================================
+
+class TestMixCommand:
+    def test_resolve_mix_pair_from_command_message(self):
+        assert _resolve_mix_emoji_pair("mix 😀😺") == ("😀", "😺")
+        assert _resolve_mix_emoji_pair("/mix 😀 😺") == ("😀", "😺")
+        assert _resolve_mix_emoji_pair("😀😺") == ("😀", "😺")
+
+    def test_resolve_mix_pair_from_parsed_params(self):
+        assert _resolve_mix_emoji_pair("mix ignored", "😀", "😺") == ("😀", "😺")
+        assert _resolve_mix_emoji_pair("/mix ignored", "😀😺") == ("😀", "😺")
+
+    @pytest.mark.asyncio
+    async def test_mix_command_accepts_message_with_command_name(self, plugin_with_meta):
+        mock_event = MagicMock()
+        mock_event.message_str = "mix 😀😺"
+        mock_event.chain_result = lambda c: ("chain", c)
+        mock_event.plain_result = lambda t: ("plain", t)
+
+        plugin_with_meta._download_image = AsyncMock(return_value="/tmp/path")
+
+        results = []
+        async for r in plugin_with_meta.mix_command(mock_event):
+            results.append(r)
+
+        assert results and results[0][0] == "chain"
+        plugin_with_meta._download_image.assert_called_once_with(
+            "https://www.gstatic.com/emoji/1f600_1f63a.png"
+        )
+        mock_event.stop_event.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_mix_command_uses_parsed_params(self, plugin_with_meta):
+        mock_event = MagicMock()
+        mock_event.message_str = "mix ignored"
+        mock_event.chain_result = lambda c: ("chain", c)
+        mock_event.plain_result = lambda t: ("plain", t)
+
+        plugin_with_meta._download_image = AsyncMock(return_value="/tmp/path")
+
+        results = []
+        async for r in plugin_with_meta.mix_command(mock_event, "😀", "😺"):
+            results.append(r)
+
+        assert results and results[0][0] == "chain"
+        plugin_with_meta._download_image.assert_called_once_with(
+            "https://www.gstatic.com/emoji/1f600_1f63a.png"
+        )
+
 
 # ============================================================
 # Tests: Regex (Existing tests kept for regression check)
